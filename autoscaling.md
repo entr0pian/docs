@@ -1,6 +1,6 @@
 # Autoscaling: HPA and the Metrics API
 
-Covers how an application scales to handle traffic fluctuations. This entry covers the HorizontalPodAutoscaler, the resource-metrics path that backs it, and the custom-metrics path via Prometheus Adapter — VerticalPodAutoscaler, KEDA, and Cluster Autoscaler are distinct enough topics to earn their own sections here later rather than a new file each.
+Covers how an application scales to handle traffic fluctuations. This entry covers the HorizontalPodAutoscaler, the resource-metrics path that backs it, the custom-metrics path via Prometheus Adapter, and KEDA's event-driven layer on top of HPA — VerticalPodAutoscaler and Cluster Autoscaler are distinct enough topics to earn their own sections here later rather than a new file each.
 
 ---
 
@@ -179,6 +179,132 @@ Every one of those rules lives in a single shared ConfigMap for the whole adapte
 
 ---
 
+## A Third API Group: Why External Metrics Can't Just Be Custom Metrics
+
+> **Question:** `custom.metrics.k8s.io` already lets a metric carry an arbitrary name and value. Why does a metric with no corresponding Kubernetes object need an entirely separate API group instead of just being a `custom.metrics.k8s.io` entry with an empty `describedObject`?
+
+Because `describedObject` isn't just a response field — it's downstream of the URL structure, and the URL structure is downstream of Kubernetes' authorization model. Look at how a custom metric is actually addressed:
+
+```
+custom.metrics.k8s.io:   /apis/custom.metrics.k8s.io/v1beta2/namespaces/{ns}/pods/*/{metricName}?labelSelector=...
+external.metrics.k8s.io: /apis/external.metrics.k8s.io/v1beta1/namespaces/{ns}/{metricName}?labelSelector=...
+```
+
+The custom-metrics path always resolves through a real resource type — `pods` in this example, or a named object for the `Object` metric type. That segment isn't decoration: RBAC grants verbs on `(resource, namespace)` pairs, and `pods` is a resource type the apiserver already knows how to enumerate and scope. The discovery document for `custom.metrics.k8s.io` is organized the same way — per resource type, "here are the metrics available for Pods" — because the whole API assumes there's an existing Kubernetes object on the other end of every request.
+
+An SQS queue depth or a Datadog check result has no such object. There's no `Pod`, no `Ingress`, nothing in etcd that the metric is "about." Making that fit the custom-metrics shape would mean either making `describedObject` optional (quietly breaking the per-resource-type discovery and RBAC model every existing consumer already depends on) or inventing a fake resource type purely so the URL has something to anchor to — lying to the authorization system about what kind of thing is being accessed. Neither is a schema tweak; both are integrity problems.
+
+So `external.metrics.k8s.io` just drops the resource segment entirely and goes straight from namespace to metric name, with the `labelSelector` doing all of the narrowing that the resource-type segment would otherwise help with. The response type follows the same shape shift: `ExternalMetricValue` has no `describedObject`, only `metricName`, `metricLabels` (whatever labels the matched series actually carried), and `value`. The fork — "is this fundamentally about a Kubernetes object, or not?" — gets decided once, by which API group a request lands in, rather than being a field a client has to defensively check on every response.
+
+---
+
+## KEDA: An Operator That Manages HPAs, Not a Metrics Backend That Replaces Them
+
+KEDA (Kubernetes Event-Driven Autoscaling) doesn't compete with HPA the way it might first sound — it's a layer that creates and manages an `HorizontalPodAutoscaler` on your behalf, wired to an `External` metric that KEDA itself supplies. You never author the HPA directly; you author a much higher-level object describing what to scale and what event source to watch.
+
+KEDA ships as three separate pieces, each with a distinct job:
+
+| Component | Type | Job |
+|---|---|---|
+| `keda-operator` | Controller | Watches `ScaledObject`/`ScaledJob` CRs; creates/manages the corresponding `HorizontalPodAutoscaler`; handles the 0-replica edge case HPA itself can't |
+| `keda-operator-metrics-apiserver` | Extension apiserver | Registers the `APIService` for `external.metrics.k8s.io`; runs the actual scaler logic (poll SQS, evaluate a PromQL expression, etc.) and answers the HPA controller's queries |
+| `keda-admission-webhooks` | Validating webhook | Rejects a `ScaledObject` at creation time if its target is already managed by an HPA KEDA doesn't own |
+
+The CRDs it installs: `ScaledObject` and `ScaledJob` (what to scale, and from which event source), plus `TriggerAuthentication`/`ClusterTriggerAuthentication` (how to authenticate to that event source) — a separate auth object referenced by pointer from the scaling object, the same separation-of-concerns pattern as a `ProviderConfig` referenced from a managed resource in other operator ecosystems.
+
+One structural point worth being precise about: every scaler KEDA supports — SQS, Kafka, Prometheus, cron, RabbitMQ, on the order of 70 total — is Go code compiled directly into `keda-operator-metrics-apiserver`. There's no separate package to install per event source; the `type` field in a trigger just selects which already-compiled-in code path runs.
+
+---
+
+## Walking Through a ScaledObject, End to End
+
+### 1. Install: the `APIService` registration
+
+This happens once, at KEDA install time, using the exact aggregation mechanism the Prometheus Adapter section walked through — no new mechanism, just a new backend registering against a different group:
+
+```yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.external.metrics.k8s.io
+spec:
+  service:
+    name: keda-operator-metrics-apiserver
+    namespace: keda
+  group: external.metrics.k8s.io
+  version: v1beta1
+```
+
+### 2. You create a `ScaledObject`
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: order-processor-scaler
+spec:
+  scaleTargetRef:
+    name: order-processor        # the Deployment being scaled
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: order-queue-auth
+      metadata:
+        queueURL: "https://sqs.eu-west-1.amazonaws.com/123456789012/orders"
+        queueLength: "5"
+```
+
+### 3. What KEDA actually does with it — and what it doesn't touch
+
+`keda-operator`'s reconcile loop does exactly one thing here: create/update a native `HorizontalPodAutoscaler` pointed at the same `scaleTargetRef`. **The target Deployment itself is never modified** — no sidecar injected, no env var added, no annotation written. `order-processor`'s pods have no idea KEDA, HPA, or any metrics plumbing exists; they're a completely ordinary Deployment whose `replicas` field the (built-in, stock) HPA controller adjusts the same way it would for any other HPA-managed workload. All of the actual metric-fetching machinery — reading the `TriggerAuthentication`-referenced credentials, polling SQS — lives entirely inside `keda-operator-metrics-apiserver`, a component that sits beside the target Deployment, not inside its pod spec.
+
+### 4. The generated `HorizontalPodAutoscaler`
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: keda-hpa-order-processor-scaler
+  labels:
+    app.kubernetes.io/managed-by: keda-operator
+    scaledobject.keda.sh/name: order-processor-scaler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-processor
+  minReplicas: 1      # floored at 1 — KEDA handles 0↔1 itself, outside this object
+  maxReplicas: 10
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: s0-aws-sqs-queue
+          selector:
+            matchLabels:
+              scaledobject.keda.sh/name: order-processor-scaler
+        target:
+          type: AverageValue
+          averageValue: "5"
+```
+
+The generated metric name (`s0-aws-sqs-queue` — trigger index + trigger type) is **not** unique on its own; any other `ScaledObject` whose first trigger is also `aws-sqs-queue` produces the identical name. That's exactly why the `selector` is load-bearing rather than decorative — it's the only thing letting KEDA's apiserver tell two colliding-name requests apart.
+
+### 5. What the HPA controller actually queries
+
+The built-in HPA controller, on its normal 15s cycle, reads this object and issues:
+
+```
+GET /apis/external.metrics.k8s.io/v1beta1/namespaces/default/s0-aws-sqs-queue
+    ?labelSelector=scaledobject.keda.sh%2Fname%3Dorder-processor-scaler
+```
+
+— a single targeted request, metric name baked into the path exactly like the custom-metrics case earlier, `labelSelector` sent as a real query parameter. `keda-operator-metrics-apiserver` parses both out of the request, uses the `(metricName, selector)` pair to find the one matching `ScaledObject`'s scaler instance, and returns a one-item `ExternalMetricValueList` — the last value that scaler computed from its own independent poll of SQS, not a fetch triggered live by this request.
+
+---
+
 ## What This Covers So Far
 
-This section now covers the resource-metric path (HPA scaling on CPU/memory via metrics-server) and the custom-metric path (HPA scaling on an arbitrary Prometheus-backed metric via Prometheus Adapter). It doesn't yet cover how KEDA layers on top of HPA to add scale-to-zero, how VerticalPodAutoscaler's evict-and-recreate model interacts (and conflicts) with HPA, or how Cluster Autoscaler provides the node capacity HPA's desired replica count assumes exists — see `kubernetes_scenarios.md`'s node-replacement scenario for that last piece in the meantime. Each of those is a candidate for its own section here.
+This section now covers the resource-metric path (HPA scaling on CPU/memory via metrics-server), the custom-metric path (HPA scaling on an arbitrary Prometheus-backed metric via Prometheus Adapter), why external metrics needed their own API group rather than folding into custom metrics, and KEDA's architecture through the point where its generated HPA queries that external metric. It doesn't yet cover exactly how KEDA handles the 0↔1 scale-to-zero transition it was flagged as bypassing HPA for above, how VerticalPodAutoscaler's evict-and-recreate model interacts (and conflicts) with HPA, or how Cluster Autoscaler provides the node capacity HPA's desired replica count assumes exists — see `kubernetes_scenarios.md`'s node-replacement scenario for that last piece in the meantime. Each of those is a candidate for its own section here.
