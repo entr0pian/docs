@@ -1,6 +1,6 @@
 # Autoscaling: HPA and the Metrics API
 
-Covers how an application scales to handle traffic fluctuations. This entry starts with the HorizontalPodAutoscaler and the resource-metrics path that backs it — VerticalPodAutoscaler, custom/external metrics, KEDA, and Cluster Autoscaler are distinct enough topics to earn their own sections here later rather than a new file each.
+Covers how an application scales to handle traffic fluctuations. This entry covers the HorizontalPodAutoscaler, the resource-metrics path that backs it, and the custom-metrics path via Prometheus Adapter — VerticalPodAutoscaler, KEDA, and Cluster Autoscaler are distinct enough topics to earn their own sections here later rather than a new file each.
 
 ---
 
@@ -81,6 +81,104 @@ A common real-world failure mode sits at the metrics-server → kubelet hop: met
 
 ---
 
+## The Custom Metrics API: What Problem It Solves
+
+> **Question:** `metrics.k8s.io` already gives HPA a working metrics path. Why does a second, structurally different API group exist instead of just teaching that one to return more kinds of numbers?
+
+Because its schema has no room for more kinds of numbers. `PodMetrics` has exactly one shape: a `containers[]` array where each entry carries `usage.cpu` and `usage.memory` and nothing else. There's no field to put "http requests per second" or "queue depth" into — the type was written around two specific numbers, not an arbitrary one.
+
+`custom.metrics.k8s.io` exists to be the opposite kind of schema: a generic envelope built around a name and a value, instead of fixed fields.
+
+**Side by side, the divergence is visible directly in the response body.**
+
+`metrics.k8s.io/v1beta1` (`PodMetrics`) — fixed, no metric identity of its own:
+
+```json
+{
+  "kind": "PodMetrics",
+  "containers": [
+    { "name": "app", "usage": { "cpu": "5m", "memory": "10Mi" } }
+  ]
+}
+```
+
+`custom.metrics.k8s.io/v1beta2` (`MetricValueList`) — generic, the metric names itself:
+
+```json
+{
+  "kind": "MetricValueList",
+  "items": [
+    {
+      "describedObject": { "kind": "Pod", "name": "pod-x", "apiVersion": "v1" },
+      "metricName": "http_requests_per_second",
+      "value": "12500m"
+    }
+  ]
+}
+```
+
+The difference is which side carries meaning. In `PodMetrics`, the meaning ("this is CPU," "this is memory") is baked into the field name — `usage.cpu` always means CPU, because the schema's author decided that at design time. In `MetricValueList`, the meaning is data, not schema: `metricName` is just a string, so the same type can carry `http_requests_per_second` today and `queue_depth` tomorrow without the API definition ever changing. What's still fixed is the *frame* around that string: every item is a value paired with a `describedObject` — some specific Kubernetes object the number is claimed to be about. That's the actual problem this API solves: giving an arbitrary metric a standard, machine-checkable way to say "this number belongs to this Pod," so HPA (or any other client) can consume it without knowing in advance what the number even is.
+
+---
+
+## A Tempting Shortcut: Pointing the Aggregation Layer at Prometheus Directly
+
+A reasonable first instinct, once Prometheus is already in the cluster scraping this exact data: it already has `http_requests_per_second` sitting in its TSDB, so why not register an `APIService` for `custom.metrics.k8s.io/v1beta2` with `service:` pointing straight at Prometheus's own `Service`, and skip building anything new?
+
+Recall from the aggregation-layer mechanics earlier: `kube-aggregator` doesn't inspect or validate what's behind an `APIService` at registration time — it just proxies the raw HTTP request to whatever `Service` the object names, and trusts whatever comes back. Nothing stops the `APIService` object itself from applying cleanly this way. It breaks the moment anything actually tries to use it:
+
+- **Prometheus was never asked to speak the Kubernetes API's List/Get/Watch conventions.** kube-aggregator can proxy the bytes, but it can't make Prometheus's server understand a request like `GET /apis/custom.metrics.k8s.io/v1beta2/namespaces/default/pods/*/http_requests_per_second` — its HTTP server only understands its own query endpoint (`/api/v1/query`, taking a PromQL expression as a parameter), not this URL shape at all.
+- **Even given a translated URL, the response shape is still wrong.** Prometheus's answer is a PromQL result — a list of `{metric labels, timestamp, value}` tuples — not a `MetricValueList`. There's no `describedObject`, no `metricName` field; `pod: "pod-x"` is just one label among however many the series carries. HPA's controller would try to unmarshal that body as a `MetricValueList` and fail outright, because the two JSON shapes have nothing in common beyond both being JSON.
+
+The shortcut doesn't fail at registration — `kubectl apply` on the `APIService` succeeds either way, since nothing checks the backend's actual behavior up front. It fails downstream, silently from the aggregation layer's point of view, the first time anything tries to read from it. That gap — something has to speak the aggregation layer's expected HTTP contract *and* reshape PromQL's answer into a `MetricValueList` — is exactly the job Prometheus Adapter exists to do.
+
+---
+
+## Prometheus Adapter: Its Exact Role
+
+Prometheus Adapter is a small extension apiserver — the same category of thing as metrics-server, built on the same `k8s.io/apiserver` library, running as its own Deployment with its own serving cert — whose entire job is closing that gap in both directions at once:
+
+1. **Speaking the contract.** It implements the actual List/Get/Watch semantics `custom.metrics.k8s.io` requires, including the discovery call (`kubectl get --raw /apis/custom.metrics.k8s.io/v1beta2` lists every metric it currently knows how to serve) that lets a client discover what's available before asking for a specific one.
+2. **Translating the request.** Given an incoming request naming a metric and a Kubernetes object selector, it consults a set of configured **rules** to decide which PromQL expression corresponds to that metric name, substitutes in the object's identity (namespace, label selector, resource type), and issues that query against Prometheus's ordinary `/api/v1/query` endpoint — the same endpoint any other Prometheus client would use.
+3. **Translating the response.** It takes the PromQL vector result back and, for each series, builds one `MetricValueList` item: the series' relevant label (e.g. `pod`) becomes the `describedObject`, the configured metric name becomes `metricName`, and the scalar becomes `value`.
+
+Nothing about Prometheus itself changes to make this work — from Prometheus's perspective, the adapter is just another client issuing ordinary queries on some schedule. All of the Kubernetes-API-shaped behavior lives entirely in the adapter process; Prometheus never needs to know this consumer is any different from a person poking around in its UI.
+
+### A Config Example, Traced End to End
+
+A representative adapter rule, in the shape of its `seriesQuery`-based config:
+
+```yaml
+rules:
+  - seriesQuery: 'http_requests_total{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: { resource: "namespace" }
+        pod: { resource: "pod" }
+    name:
+      matches: "^(.*)_total$"
+      as: "${1}_per_second"
+    metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+```
+
+Walking one request through it:
+
+- HPA (via kube-apiserver) asks for `http_requests_per_second` on `Pods` matching some label selector, in namespace `default`.
+- The adapter matches this against the `name.as` pattern (`http_requests_per_second` reverses to the underlying series `http_requests_total`) and the `resources` block (a `pod`-scoped metric).
+- It fills in the `metricsQuery` template and issues, against Prometheus's own query API: `sum(rate(http_requests_total{namespace="default", pod=~"..."}[2m])) by (pod)` — the exact string a person would type into Prometheus's own UI to eyeball the same number for reference.
+- Prometheus returns its native vector result (label set + scalar) for however many pods matched.
+- The adapter reshapes each series into a `MetricValueList` item — `describedObject` from the `pod` label, `metricName: http_requests_per_second`, `value` from the scalar — and that's the body kube-apiserver hands back up the chain to HPA.
+
+The `metricsQuery` template is worth sitting with for a moment: it isn't a fixed query, it's PromQL with placeholders the adapter fills in per request. That's what lets one rule serve the metric for *any* pod selector HPA asks about, rather than needing a separate rule per object.
+
+---
+
+## One Rule Per Metric, One Adapter Per Cluster
+
+Every one of those rules lives in a single shared ConfigMap for the whole adapter Deployment — one metric-to-query mapping added by hand, cluster-wide, covering every team's every custom metric. There's no per-metric Kubernetes object to create, inspect with `kubectl get`, or scope with RBAC to a single team; changing what's scalable means editing one shared file and reloading one shared pod. It's fair to wonder whether this is the ceiling on the pattern, or whether the same translate-and-serve idea could be pushed further — one small declarative object per scaling target instead of one shared config file, reconciled by a controller, generalized past Prometheus to whatever backend a given target actually needs. That's a thread worth pulling on its own later.
+
+---
+
 ## What This Covers So Far
 
-This section is the resource-metric path only: HPA scaling on CPU/memory via metrics-server. It doesn't yet cover how a custom or external metric gets into this same chain (a Prometheus Adapter registering its own `APIService` for `custom.metrics.k8s.io`), how KEDA layers on top of HPA to add scale-to-zero, how VerticalPodAutoscaler's evict-and-recreate model interacts (and conflicts) with HPA, or how Cluster Autoscaler provides the node capacity HPA's desired replica count assumes exists — see `kubernetes_scenarios.md`'s node-replacement scenario for that last piece in the meantime. Each of those is a candidate for its own section here.
+This section now covers the resource-metric path (HPA scaling on CPU/memory via metrics-server) and the custom-metric path (HPA scaling on an arbitrary Prometheus-backed metric via Prometheus Adapter). It doesn't yet cover how KEDA layers on top of HPA to add scale-to-zero, how VerticalPodAutoscaler's evict-and-recreate model interacts (and conflicts) with HPA, or how Cluster Autoscaler provides the node capacity HPA's desired replica count assumes exists — see `kubernetes_scenarios.md`'s node-replacement scenario for that last piece in the meantime. Each of those is a candidate for its own section here.
