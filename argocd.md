@@ -52,14 +52,22 @@ Installing the common `argo-cd` Helm chart doesn't deploy "an ArgoCD" — it dep
 
 ---
 
-## 3. Resource Tracking — How an `Application` Connects to Its Deployment
+## 3. The Application Resource Tree — How Managed Resources Are Discovered
 
-Before the reconcile flow in §4 makes sense, one thing has to be pinned down: the Application Controller has no built-in notion of "everything under this Helm chart belongs to app X." It has to be told, and it's told via a marker stamped onto every resource it applies.
+Before the reconcile flow in §4 makes sense, one thing has to be pinned down: the Application Controller has no built-in notion of "everything under this Helm chart belongs to app X." Every resource in an Application's tree gets there through one of exactly two mechanisms.
+
+**Directly tracked resources** — anything ArgoCD itself applies gets stamped with a tracking marker:
 
 - **Legacy/default:** the label `app.kubernetes.io/instance: <app-name>`.
 - **Recommended today:** the annotation `argocd.argoproj.io/tracking-id`, which encodes `<app-name>:<group>/<kind>:<namespace>/<name>`. Moving to an annotation avoids colliding with a user's own `app.kubernetes.io/instance` label (a very common label to already be using for something else), and it carries more structure than a bare label value.
 
-This marker is the index key for everything in §4 — it's how a resource discovered via a cluster-wide watch gets attributed back to a specific `Application`.
+**Transitively discovered resources** — anything *not* directly applied by ArgoCD (a Deployment's ReplicaSet, a custom operator's child objects it creates during its own reconcile) carries no tracking marker at all. These are linked into the tree purely by walking `ownerReferences` back to something that *is* tracked. This is also the mechanism the cluster cache in §4 relies on to attribute a watched resource's change back to the right `Application`.
+
+### Gotchas
+
+- **A missing `ownerReference` doesn't just cost you health — it costs you everything.** If an operator creates a child object without setting `ownerReferences` back to its parent CR, that child is invisible to the tree: not shown in the Application's resource view, not included in the normalized diff, not counted in health aggregation (§5), and not eligible for `prune: true` cleanup. Setting `ownerReferences` on every child object is a correctness requirement for any custom resource you want ArgoCD to manage cleanly — not a nice-to-have.
+- **Being discovered and having a health verdict are two separate things.** A resource can be fully present in the tree (via either mechanism above) and still contribute nothing to the Application's aggregate health, if its Kind has no registered health check — see §5. This is exactly what happened in the CRD-health incident documented in `gitops_and_argocd.md`: `Backend`, `RDSInstance`, and `SQSQueue` were all correctly discovered and diffed, but showed a blank Health column because no check existed yet for those kinds.
+- **Discovery is what makes `Synced` meaningful; it's independent of what makes `Healthy` meaningful.** The normalized diff in §4 runs against every discovered resource, tracked or transitive, regardless of whether that resource's kind has a health check registered. Sync status and health status are computed from the same tree but are otherwise unrelated signals.
 
 ---
 
@@ -119,3 +127,93 @@ Deployment reverted to Git's declared state; health re-evaluated afterward
 ### Why "full apply, not a patch" matters
 
 Sync sends the complete rendered manifest and applies it the way `kubectl apply` does — a three-way merge (using the last-applied-config annotation, or Server-Side Apply field ownership if `ServerSideApply=true` is set) — rather than a raw JSON Patch or a full `replace`. That merge semantics is exactly why a field genuinely absent from Git (e.g. `spec.replicas` when an HPA/KEDA owns it) survives a sync untouched: the apply only asserts the fields present in the rendered manifest, it doesn't overwrite the object wholesale. An opt-in `Replace=true` sync option exists for a full delete/recreate, but it isn't the default path.
+
+---
+
+## 5. Application Health
+
+Health is a separate signal from sync status: `Synced` only means the last apply matched Git — it says nothing about whether the resources that were applied are actually working. Health is what answers that.
+
+### 5.1 The Status Values
+
+| Status | Meaning | Typical trigger |
+|---|---|---|
+| `Healthy` | Live state matches the desired end-state | Deployment: ready/available/updated replicas all match desired, no stalled condition |
+| `Progressing` | Actively moving toward desired state, nothing wrong yet | Rollout in progress; new Pods not yet ready; a custom resource's `status.conditions` not yet populated |
+| `Degraded` | Explicitly failed or stuck | A Deployment's `Progressing` condition reporting `ProgressDeadlineExceeded`; a Job that failed; a custom resource with a condition explicitly `status: "False"` |
+| `Suspended` | Intentionally paused, not broken | `Job.spec.suspend: true`; a paused Argo Rollout waiting for manual promotion |
+| `Missing` | Declared in Git, not present live at all | Resource hasn't been created yet, or was deleted externally |
+| `Unknown` | ArgoCD tried to assess and couldn't | A Lua health script throws an error during evaluation |
+
+A seventh case sits outside this table entirely: a resource whose Kind has **no health check registered at all** (built-in or Lua) gets no value here — not `Unknown`, just blank, and it doesn't participate in the aggregation below either way (see the CRD-health gotcha in §3).
+
+### 5.2 How ArgoCD Reasons About a Single Resource's Health
+
+There's no generic convention ArgoCD reads off every object — no universal "status: OK" field. Every Kind's health comes from one of two sources:
+
+**Built-in Go checks**, for a fixed set of well-known kinds ArgoCD ships hardcoded logic for (Deployment, ReplicaSet, StatefulSet, DaemonSet, Pod, Job, PVC, Service, Ingress, and others). For Deployment specifically, this is roughly: if `status.observedGeneration` lags `metadata.generation`, the controller hasn't even seen the latest spec yet → `Progressing`; if the `Progressing` condition reports `status: False` (reason `ProgressDeadlineExceeded`) → `Degraded`; if `updatedReplicas`/`availableReplicas` haven't caught up to `spec.replicas` yet → `Progressing`; otherwise → `Healthy`.
+
+**Lua scripts**, for everything else — in practice, every CRD. Registered in `argocd-cm` under a key scoped to the exact API group and kind:
+
+```
+resource.customizations.health.<group>_<kind>: |
+  <lua>
+```
+
+The script receives an implicit global, `obj` — the live resource, structured as a Lua table mirroring the exact JSON the API server returns (`obj.status.conditions`, `obj.spec.replicas`, whatever the CRD's schema has). It must return a table with a `status` field set to one of the values in §5.1, and optionally a `message` string surfaced in the UI/CLI. If the script errors or never sets `status`, that resource's health becomes `Unknown`.
+
+The real example already in this repo, from `gitops_and_argocd.md` — a single condition-agnostic script reused across three custom resources via a YAML anchor:
+
+```yaml
+resource.customizations.health.apps.taskapp.io_Backend: &conditionsHealthCheck |
+  local hs = {}
+  if obj.status == nil or obj.status.conditions == nil or #obj.status.conditions == 0 then
+    hs.status = "Progressing"
+    hs.message = "Waiting for status.conditions"
+    return hs
+  end
+  local degraded = {}
+  local progressing = false
+  for i, condition in ipairs(obj.status.conditions) do
+    if condition.status == "False" then
+      table.insert(degraded, (condition.type or "condition") .. ": " .. (condition.message or ""))
+    elseif condition.status ~= "True" then
+      progressing = true
+    end
+  end
+  if #degraded > 0 then
+    hs.status = "Degraded"
+    hs.message = table.concat(degraded, "; ")
+  elseif progressing then
+    hs.status = "Progressing"
+  else
+    hs.status = "Healthy"
+  end
+  return hs
+resource.customizations.health.database.taskapp.io_RDSInstance: *conditionsHealthCheck
+resource.customizations.health.queue.taskapp.io_SQSQueue: *conditionsHealthCheck
+```
+
+It doesn't look for a specific condition name (`Backend`, `RDSInstance`, and `SQSQueue` don't even agree on one) — it just checks that whatever `metav1.Condition`s are present are all `True`. That's what makes one script reusable across three unrelated CRDs via the alias.
+
+### 5.3 Aggregation — Worst Status Wins Across the Tree
+
+An Application's overall health is the worst status found among every resource in its tree that actually produced a verdict (§3's "discovered but unassessed" resources are excluded from this comparison entirely, not counted as passing). Concretely: if anything in the tree reports `Degraded`, the Application reports `Degraded`, regardless of how many other resources say `Healthy`. If nothing is `Degraded` but something is still `Progressing`, the Application reports `Progressing`. Only when every resource that produces a verdict says `Healthy` does the Application read `Healthy`.
+
+### 5.4 Example — A Built-in Check Bubbling `Degraded` Through the Tree
+
+Using the `taskapp-backend-prod` tree from §3: `Backend`, `RDSInstance`, and `SQSQueue` are all fully provisioned and their Lua checks all report `Healthy`. The Deployment has 2 desired replicas; one Pod is healthy, the other is stuck in `CrashLoopBackOff`.
+
+```
+Backend        (Lua)        → Healthy
+├─ RDSInstance (Lua)        → Healthy
+├─ SQSQueue    (Lua)        → Healthy
+└─ Deployment  (built-in)   → Progressing   (availableReplicas < spec.replicas)
+   └─ ReplicaSet             (no check registered — excluded from aggregation)
+      ├─ Pod #1 (built-in)  → Healthy
+      └─ Pod #2 (built-in)  → Degraded      (CrashLoopBackOff, Ready: False)
+
+Application aggregate → Degraded
+```
+
+The worst verdict in the tree came from a built-in check three levels down, not from any of the Lua-derived ones sitting at the top — and the aggregation doesn't distinguish where a verdict came from. A `Degraded` Pod overrides three `Healthy` Lua results just as readily as a `Degraded` custom resource would override three healthy Pods.
