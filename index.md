@@ -215,3 +215,14 @@ Kept in sync whenever a doc is created or a section is added — see
   - How each operation handles cancellation
   - The duplicate task edge case
   - SQS cost
+
+- [`workloads.md`](./workloads.md) — Workload Controllers: Deployment vs StatefulSet
+  - Deployment: Fungible Pods, No Identity
+  - StatefulSet: Stable Identity for Clustered / Data-Bearing Workloads
+    - Pod identity
+    - Storage identity
+    - Network identity
+    - Worked example
+    - Startup/shutdown ordering
+  - The Decision Rule
+  - What This Covers So Far
