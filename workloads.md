@@ -1,10 +1,15 @@
-# Workload Controllers: Deployment vs StatefulSet
+# Workload Controllers: Deployment, StatefulSet, and DaemonSet
 
-Both manage a set of Pods from a template and reconcile actual replica count
-toward desired. The difference is entirely about **identity**: whether an
+Deployment and StatefulSet both manage a set of Pods from a template and
+reconcile actual replica count toward a desired number you set. The
+difference between them is entirely about **identity**: whether an
 individual Pod's storage and network address need to survive across
 restarts and be distinguishable from its siblings, or whether every Pod is
 fully interchangeable.
+
+DaemonSet doesn't sit on that same spectrum — it answers a different
+question entirely (placement, not identity or interchangeability), covered
+in its own section below.
 
 ## Deployment: Fungible Pods, No Identity
 
@@ -186,34 +191,138 @@ can elect a primary at any ordinal). They're structural: direction protects
 against gaps in bootstrap dependency, cardinality protects against losing
 majority mid-operation.
 
+## DaemonSet: One Pod Per Node, Not a Replica Count
+
+A DaemonSet has no `spec.replicas` field. "How many Pods" isn't a number
+you set — it's implied by cluster topology: exactly one Pod per Node that
+matches the DaemonSet's `nodeSelector`/affinity/tolerations, no more, no
+less. Used for node-scoped agents — log/metrics collectors, CNI plugins,
+`kube-proxy` — where the thing being managed is the node itself, not a
+unit of application capacity.
+
+### The reconcile model
+
+The controller runs informers on DaemonSets, Nodes, and Pods — same
+List/Watch-against-the-API-server pattern every controller uses; it never
+talks to a kubelet directly. For each `(DaemonSet, Node)` pair where the
+Node qualifies (passes the DaemonSet's nodeSelector/tolerations), it checks
+whether a Pod it owns (via `ownerReferences`) already targets that Node. If
+none exists, it creates one; if a qualifying Node stops qualifying (a new
+taint added, the Node deleted), it deletes the corresponding Pod. A new
+Node joining the cluster needs no manual trigger — the Node informer's add
+event drives the reconcile automatically.
+
+### How a Pod actually lands on its node
+
+Since Kubernetes 1.17, the DaemonSet controller does not schedule Pods
+itself. It creates a Pod with a hard-coded, single-node node affinity and
+hands it to the normal `kube-scheduler`, same path as any other Pod:
+
+```yaml
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchFields:
+        - key: metadata.name
+          operator: In
+          values:
+          - node-3
+```
+
+`matchFields` against `metadata.name` (a field selector on the Node object)
+rather than a label match — deliberately, so it doesn't depend on the
+`kubernetes.io/hostname` label being present or correct. There is exactly
+one value in that list, always. The scheduler still runs its usual
+admission checks against that one Node — resource fit, taints/tolerations —
+it just has no other candidate to fall back to.
+
+**This has a real consequence: a DaemonSet Pod that fails to schedule does
+not get retried against a different target.** There is no other Node that
+satisfies its affinity term — the entire point of the Pod is to be *the*
+Pod for node-3. If node-3 lacks capacity or the Pod is missing a required
+toleration, the Pod just sits `Pending` until someone fixes the actual
+blocker. This is why core DaemonSets like `kube-proxy` ship with
+`priorityClassName: system-node-critical` — preemption, not retry-elsewhere,
+is the mechanism that reclaims room for them.
+
+### Taints don't get bypassed automatically
+
+A control-plane Node typically carries `node-role.kubernetes.io/control-plane:NoSchedule`
+specifically to keep ordinary workload Pods off it. A log collector that also
+needs to run there needs an explicit toleration in its own Pod spec — nothing
+about being a DaemonSet exempts it:
+
+```yaml
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule
+    operator: Exists
+```
+
+### Cordon and drain
+
+`kubectl cordon` sets `Node.spec.unschedulable`, which blocks *new* ordinary
+Pods from landing — but the DaemonSet controller's own eligibility check
+ignores that field, by design, since agents like `kube-proxy` need to keep
+running on a Node you're about to drain, not disappear from it the moment
+it's cordoned. That's the reason `kubectl drain --ignore-daemonsets` exists
+(already used in `kubernetes_scenarios.md`'s node-replacement scenario, without
+explanation there): evicting a DaemonSet Pod would be pointless churn — the
+controller would immediately recreate an identical Pod pinned to that same
+still-existing Node. `drain` just leaves them running until the Node object
+itself is deleted.
+
+### Node deletion
+
+Covered in full in `scheduling.md`'s Pod Garbage Collection section — the
+short version: once a Node object is deleted, the PodGC controller (not the
+DaemonSet controller) removes the orphaned Pod that was bound to it. The
+DaemonSet controller doesn't create a replacement anywhere, because a
+deleted Node was the only valid target that Pod ever had.
+
 ## The Decision Rule
 
-Not "stateless vs stateful" — plenty of stateful software runs fine on a
-Deployment with one PVC and one replica; it just isn't *clustered*. The
-actual condition: **use a StatefulSet when replicas need to address or
-distinguish each other by a stable, persistent identity that survives
-rescheduling** — a leader that replicas must reconnect to by name, a
-consensus ensemble whose members are statically configured by address, a
-shard whose data is pinned to a specific instance. Use a Deployment when
-every replica is interchangeable and nothing — not a peer, not a client,
-not the app itself — needs to know or care which specific instance handled
-the last request.
+For Deployment vs StatefulSet: not "stateless vs stateful" — plenty of
+stateful software runs fine on a Deployment with one PVC and one replica; it
+just isn't *clustered*. The actual condition: **use a StatefulSet when
+replicas need to address or distinguish each other by a stable, persistent
+identity that survives rescheduling** — a leader that replicas must
+reconnect to by name, a consensus ensemble whose members are statically
+configured by address, a shard whose data is pinned to a specific instance.
+Use a Deployment when every replica is interchangeable and nothing — not a
+peer, not a client, not the app itself — needs to know or care which
+specific instance handled the last request.
+
+DaemonSet is orthogonal to that whole axis. It isn't "in between" Deployment
+and StatefulSet on an identity spectrum — it answers *where*, not *how many*
+or *whether interchangeable*: run exactly one instance per matching Node,
+forever, regardless of any desired count. Reach for it when the workload's
+job is intrinsically about the Node it runs on, not about serving
+application traffic.
 
 ## What This Covers So Far
 
-This covers Deployment's Pod-selection ranking and StatefulSet's three
-identity mechanisms (Pod naming, per-ordinal PVCs via
-`volumeClaimTemplates`, per-Pod DNS via a headless Service) plus why
-startup/shutdown ordering matters, split into the direction guarantee
-(bootstrap dependency) and the cardinality guarantee (quorum preservation).
+This covers Deployment's Pod-selection ranking; StatefulSet's three identity
+mechanisms (Pod naming, per-ordinal PVCs via `volumeClaimTemplates`, per-Pod
+DNS via a headless Service) and why startup/shutdown ordering matters, split
+into the direction guarantee (bootstrap dependency) and the cardinality
+guarantee (quorum preservation); and DaemonSet's reconcile model (no replica
+count, per-node fixed node-affinity pinning via the normal scheduler, why a
+failed schedule never retries elsewhere, the cordon/drain exemption, and
+Node-deletion cleanup).
 
-Not yet covered: DaemonSets (the third leg of the original question — next
-session); how failover actually works once a primary dies (how a Patroni-style
-operator detects it and repoints the other replicas — the `primary_conninfo`
-mechanism above is only half the story); `persistentVolumeClaimRetentionPolicy`
-and what happens to PVCs when a StatefulSet itself (not just a Pod) is deleted
-or scaled down; partitioned rolling updates via
-`spec.updateStrategy.rollingUpdate.partition` (StatefulSet's canary-style
-mechanism, no Deployment equivalent); and how a PodDisruptionBudget interacts
-with `OrderedReady` during *involuntary* disruption (a node drain) rather than
-the voluntary rollouts/scale-downs discussed here.
+Not yet covered: how failover actually works once a StatefulSet primary
+dies (how a Patroni-style operator detects it and repoints the other
+replicas — the `primary_conninfo` mechanism above is only half the story);
+`persistentVolumeClaimRetentionPolicy` and what happens to PVCs when a
+StatefulSet itself (not just a Pod) is deleted or scaled down; partitioned
+rolling updates via `spec.updateStrategy.rollingUpdate.partition`
+(StatefulSet's canary-style mechanism, no Deployment equivalent); how a
+PodDisruptionBudget interacts with `OrderedReady` during *involuntary*
+disruption (a node drain) rather than the voluntary rollouts/scale-downs
+discussed here; DaemonSet's own update strategy (`RollingUpdate` vs
+`OnDelete`, `maxUnavailable`) — no ordinal concept at all, worth contrasting
+directly against StatefulSet's ordering; and static Pods (kubelet-managed
+manifests), a mechanism people sometimes confuse with DaemonSets but which
+doesn't go through the API server's scheduling path at all.
