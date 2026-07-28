@@ -13,6 +13,23 @@ Scheduling happens in two phases:
 
 If no Node passes the filtering phase, the Pod remains `Pending`.
 
+### Binding: Making the Decision Permanent
+
+Scoring picks a winning Node, but the scheduler doesn't just note that
+internally — it makes one explicit API call: a `POST` to the Pod's
+`binding` subresource, naming the target Node. The API server turns that
+into setting `pod.spec.nodeName`. This happens exactly once per Pod object,
+and the field is immutable afterward — nothing in Kubernetes ever moves a
+running Pod from one Node to another.
+
+Any apparent "rescheduling" you've seen elsewhere isn't the same Pod
+relocating. When a ReplicaSet-owned Pod ends up on a different Node after
+its original one failed, that's the old Pod object being deleted and a
+brand-new one — new name, new UID, no `nodeName` yet — created by the
+owning controller, which independently goes through this exact same
+filter → score → bind cycle and can land anywhere that fits. The Pod
+identity changed; only the *replica* persisted.
+
 ### Influencing Scheduling
 
 | Mechanism | Description | Example |
@@ -178,9 +195,64 @@ The `kubelet` monitors Node resource consumption and evicts Pods when thresholds
 
 ---
 
+## Pod Garbage Collection
+
+A fourth removal path, distinct from the three covered above (API-initiated
+eviction, node-pressure eviction, and the `NoExecute`-taint path flagged in
+the gotchas under Influencing Scheduling): the **PodGC controller**, part of
+`kube-controller-manager`, cleans up Pods whose bound Node no longer exists
+as an API object.
+
+Because `pod.spec.nodeName` is immutable (see Binding, above), deleting a
+Node doesn't touch any Pod that was bound to it — the Pod object just sits
+there, still claiming `nodeName: worker-3`, pointing at a Node that's gone.
+Nothing will ever update its status again: the kubelet that owned it no
+longer exists to report anything or run a graceful termination. PodGC's
+reconcile loop lists all Pods, checks each one's `nodeName` against the live
+Node set from its own Node lister, and force-deletes — skipping graceful
+termination entirely, since there's no kubelet left to ask — any Pod whose
+Node is missing.
+
+This is a general-purpose mechanism, not aware of what (if anything) owns
+the Pod. For a ReplicaSet-owned Pod, the ReplicaSet notices the drop in
+Ready count once PodGC removes the orphan, and creates a fresh replacement
+that the scheduler binds to a live Node via the normal cycle above. For a
+DaemonSet-owned Pod there's no equivalent replacement: the DaemonSet
+controller treats a deleted Node as one fewer place a Pod should exist at
+all, so once PodGC clears the orphan, nothing recreates it anywhere — see
+`workloads.md`'s DaemonSet section for the full one-pod-per-node reconcile
+model this fits into.
+
+PodGC has two other, unrelated responsibilities worth knowing exist even
+though they're out of scope here: capping the number of terminated
+(`Succeeded`/`Failed`) Pods kept around per Node
+(`--terminated-pod-gc-threshold`), and cleaning up Pods stuck `Terminating`
+on a Node marked with the `out-of-service` taint (non-graceful Node
+shutdown handling).
+
+---
+
 ## Key Interactions
 
 - **Preemption vs. Eviction** — preemption is scheduler-driven to place a pending Pod; eviction is kubelet-driven to protect a running Node.
 - **PriorityClass affects both** — higher-priority Pods are harder to preempt and harder to evict under node pressure.
 - **PodDisruptionBudgets** protect against voluntary eviction but provide only a soft guarantee during node-pressure eviction.
 - **Resource requests matter** — they are the primary input to both the scheduling decision and the kubelet's eviction ordering.
+- **Pod GC vs. the other removal paths** — eviction and preemption remove a Pod from a Node that still exists, expecting a replacement (if any) to land elsewhere; Pod GC cleans up after the Node itself is gone. `nodeName`'s immutability is exactly why that cleanup has to be a deletion, not a reassignment.
+
+## What This Covers So Far
+
+This covers the scheduling cycle (filtering, scoring, binding) and the
+mechanisms that influence it, the three `NodeResourcesFit` scoring
+strategies, preemption and its PDB interaction, the two standard eviction
+paths plus the `NoExecute`-taint path, and Pod GC's role in cleaning up
+Pods orphaned by Node deletion.
+
+Not yet covered: scheduler extenders and running multiple schedulers in one
+cluster; the full default scoring plugin set beyond `NodeResourcesFit`,
+`PodTopologySpread`, and `ImageLocality`; the descheduler (a separate,
+non-core project that actively rebalances already-*running* Pods — distinct
+from everything here, which only acts at specific trigger points: creation,
+pressure, or an explicit request); and PodGC's other two responsibilities
+(terminated-Pod capping, `out-of-service` taint handling) in any real
+detail.

@@ -197,9 +197,12 @@ Kept in sync whenever a doc is created or a section is added — see
 
 - [`scheduling.md`](./scheduling.md) — Kubernetes Scheduling, Preemption, and Eviction
   - Scheduling
+    - Binding: Making the Decision Permanent
   - Preemption
   - Eviction
+  - Pod Garbage Collection
   - Key Interactions
+  - What This Covers So Far
 
 - [`services_and_load_balancing.md`](./services_and_load_balancing.md) — Services & Load Balancing: Spread vs. Balance
   - Can a ClusterIP Service Ensure Load Balancing for TCP Traffic?
@@ -216,7 +219,7 @@ Kept in sync whenever a doc is created or a section is added — see
   - The duplicate task edge case
   - SQS cost
 
-- [`workloads.md`](./workloads.md) — Workload Controllers: Deployment vs StatefulSet
+- [`workloads.md`](./workloads.md) — Workload Controllers: Deployment, StatefulSet, and DaemonSet
   - Deployment: Fungible Pods, No Identity
   - StatefulSet: Stable Identity for Clustered / Data-Bearing Workloads
     - Pod identity
@@ -224,5 +227,11 @@ Kept in sync whenever a doc is created or a section is added — see
     - Network identity
     - Worked example
     - Startup/shutdown ordering
+  - DaemonSet: One Pod Per Node, Not a Replica Count
+    - The reconcile model
+    - How a Pod actually lands on its node
+    - Taints don't get bypassed automatically
+    - Cordon and drain
+    - Node deletion
   - The Decision Rule
   - What This Covers So Far
