@@ -76,13 +76,6 @@ Kept in sync whenever a doc is created or a section is added — see
   - Composition Field Reference
   - Composition Functions and Pipeline Mode
 
-- [`deployment_replicasets.md`](./deployment_replicasets.md) — Kubernetes Deployment Update & Rollback Flow
-  - Core Concept
-  - Update Flow
-  - Rollback Flow
-  - Rollback History
-  - Summary
-
 - [`gitops_and_argocd.md`](./gitops_and_argocd.md) — GitOps & ArgoCD
   - Q&A format (older doc, predates the generic-file/subsection convention below); overlaps with `argocd.md` and `argocd_refresh_sync.md`. Topics covered: the GitOps model, ArgoCD's role, the reconciliation loop, `OperationState`, tracking/stopping a running sync, ArgoCD vs Jenkins/Tekton, handling manual prod changes, ArgoCD's architecture components, multi-cluster/multi-environment setup, `argocd cluster add` internals and security implications, custom resource health checks via Lua.
 
@@ -221,6 +214,14 @@ Kept in sync whenever a doc is created or a section is added — see
 
 - [`workloads.md`](./workloads.md) — Workload Controllers: Deployment, StatefulSet, and DaemonSet
   - Deployment: Fungible Pods, No Identity
+    - Update Flow
+    - Rollback Flow
+    - Rollback History
+    - Update/Rollback Summary
+    - How the ReplicaSet Controller Actually Reconciles
+    - Why the ReplicaSet Doesn't Enforce Template Conformance on Existing Pods
+    - Avoiding Overshoot: the Expectations Mechanism
+    - What Triggers Pod Replacement (and What Doesn't)
   - StatefulSet: Stable Identity for Clustered / Data-Bearing Workloads
     - Pod identity
     - Storage identity
