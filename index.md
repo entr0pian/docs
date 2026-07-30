@@ -226,6 +226,7 @@ Kept in sync whenever a doc is created or a section is added — see
     - What Triggers Pod Replacement (and What Doesn't)
     - Graceful Termination During Rollout: preStop and `terminationGracePeriodSeconds`
     - Detecting a Stuck Rollout: `progressDeadlineSeconds`
+    - Rolling Update: What to Watch For
   - StatefulSet: Stable Identity for Clustered / Data-Bearing Workloads
     - Pod identity
     - Storage identity

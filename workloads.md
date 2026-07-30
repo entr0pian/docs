@@ -352,6 +352,49 @@ a stuck rollout), and Argo CD's built-in `Deployment` health check
 specifically looks for `Progressing`/`ProgressDeadlineExceeded` to mark an
 Application `Degraded`.
 
+### Rolling Update: What to Watch For
+
+The mechanisms above, condensed into what actually has to be correct for a
+rolling update to be safe — each of these is a real, common way rollouts go
+wrong, not a hypothetical:
+
+1. **`readinessProbe` is not optional.** Without one, a new Pod enters the
+   EndpointSlice — and starts taking traffic — the instant its container is
+   `Running`, regardless of whether the app has actually finished
+   initializing (config load, connection pool warm-up, cache hydration).
+   Traffic hits it before it can serve. See
+   `pod_lifecycle_and_restarts.md`'s "startupProbe and the No-Probe
+   Defaults."
+2. **`livenessProbe` covers a failure mode readiness doesn't: a hang or
+   deadlock with no crash.** Without it, a deadlocked Pod just sits
+   `Running` / `READY 0/1` forever — nothing kills it, nothing replaces it.
+   See the same doc's "Readiness vs Liveness" section for the worked
+   example.
+3. **`startupProbe`, if startup time is slow or variable**, so a
+   `livenessProbe.initialDelaySeconds` generous enough to tolerate the
+   worst case doesn't also blunt how fast a *real* deadlock gets caught once
+   the app is actually running.
+4. **`maxSurge`/`maxUnavailable` decide an availability tradeoff, not just
+   rollout speed.** Only `maxUnavailable: 0` guarantees the Pod count
+   actually serving traffic never dips below desired replicas during the
+   rollout.
+5. **`preStop` + `terminationGracePeriodSeconds` on the way out**, or the
+   old Pod gets `SIGTERM`'d — and starts refusing/dropping connections —
+   before EndpointSlice removal has actually propagated through
+   kube-proxy/the LB. See "Graceful Termination During Rollout" above.
+6. **`progressDeadlineSeconds` reports a stuck rollout, it doesn't stop
+   one.** Nothing about the rollout changes when it trips — something has to
+   actually be watching `kubectl rollout status` or the `Progressing`
+   condition for a stuck rollout to get caught by anything other than a
+   human noticing traffic is degraded.
+7. **A `PodDisruptionBudget` doesn't protect a rollout from itself.** It
+   only gates the Eviction API (drains, cluster-autoscaler) — a
+   ReplicaSet's own scale-down deletes during a rollout are never checked
+   against it. Don't reach for a PDB expecting it to throttle your own
+   rollout; that's what `maxUnavailable` is for. See `scheduling.md`'s
+   "PodDisruptionBudget" section for what it actually protects against, and
+   how it can still stall an *unrelated* concurrent drain.
+
 ## StatefulSet: Stable Identity for Clustered / Data-Bearing Workloads
 
 A StatefulSet gives each replica a **persistent identity keyed off an
