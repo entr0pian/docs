@@ -166,53 +166,31 @@ kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
 
 ### PodDisruptionBudget: How "Voluntary" Is Actually Checked
 
-The reason PDBs exist at all: a node drain, a cluster-autoscaler scale-down,
-or a manual eviction are all **proactive, plannable** actions — unlike a
-node crashing or an OOM kill, something initiates them deliberately, which
-means something can also be made to check first whether doing so is safe.
-That check is what a PDB is.
+The reason PDBs exist: a node drain, a cluster-autoscaler scale-down, or a
+manual eviction are all **proactive, plannable** actions, unlike a node
+crashing or an OOM kill — so something can check first whether doing so is
+safe. That check is what a PDB is.
 
-The mechanism is narrower than "any voluntary pod removal," though: a PDB is
-enforced **only** at the Eviction API — the `pods/eviction` subresource.
+The mechanism is narrower than "any voluntary pod removal," though: a PDB
+is enforced **only** at the Eviction API — the `pods/eviction` subresource.
 `kubectl drain`, cluster-autoscaler, and any other caller that goes through
-that subresource get checked against the PDB's `status.disruptionsAllowed`;
-a request that would push a matching group of Pods below the budget is
-rejected outright with HTTP `429`.
-
-A Deployment's own ReplicaSet controller scaling down old Pods during a
-rolling update does **not** go through this path — it's a direct Pod
+that subresource get checked against `status.disruptionsAllowed`; a request
+that would push a matching group of Pods below the budget is rejected with
+HTTP `429`. A Deployment's own ReplicaSet controller scaling down old Pods
+during a rollout does **not** go through this path — it's a direct Pod
 `delete`, the same call used in the `What Triggers Pod Replacement` table in
-`workloads.md`. **PDBs are never consulted on that path.** A rollout's pace
-is governed solely by its own `maxSurge`/`maxUnavailable`; no PDB throttles
-it, however tight.
+`workloads.md`. **PDBs are never consulted there.** A rollout's pace is
+governed solely by its own `maxSurge`/`maxUnavailable`.
 
-`status.disruptionsAllowed` (and `currentHealthy`/`desiredHealthy` alongside
-it) isn't a ledger of who's allowed to disrupt what — it's continuously
-recomputed by the disruption controller from **live Pod health**: how many
-Pods matching the PDB's selector are currently `Ready`, compared against the
-budget. It has no memory of *why* a Pod became unavailable.
-
-That's what makes this scenario possible: a Deployment rollout and a node
-drain targeting the same PDB-selected Pods, running at the same time, on
-different paths.
-
-```
-Rollout in progress: RS deletes old Pods directly (not through eviction)
-  → currentHealthy drops → disruptionsAllowed hits 0
-      (the PDB has no idea this drop came from a rollout, not a disruption)
-
-Concurrent node drain: evicts a *different* Pod under the same PDB
-  → Eviction API checks disruptionsAllowed → sees 0 → rejects with 429
-  → kubectl drain / cluster-autoscaler retries with backoff
-
-Rollout's new Pods reach Ready → currentHealthy recovers →
-disruptionsAllowed climbs back above 0 → the next eviction retry succeeds
-```
-
-The drain isn't stuck forever — it resolves once the rollout converges and
-Pod health recovers — but it stalls for the duration of that overlap,
-entirely because the PDB is reading live health, not distinguishing which
-controller caused the dip.
+`status.disruptionsAllowed` isn't a ledger of who's allowed to disrupt what
+— it's continuously recomputed from **live Pod health** (how many Pods
+matching the selector are currently `Ready`, against the budget), with no
+memory of *why* a Pod became unavailable. Practical consequence: a
+Deployment rollout dropping `currentHealthy` can transiently zero out
+`disruptionsAllowed` for Pods sharing that PDB, causing an unrelated,
+concurrent node drain to get `429`'d and back off until the rollout's new
+Pods go Ready and health recovers — two unrelated voluntary-disruption paths
+contending over the same live number.
 
 ### Node-Pressure Eviction (Kubelet-Initiated)
 

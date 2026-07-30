@@ -217,6 +217,7 @@ Kept in sync whenever a doc is created or a section is added — see
 - [`workloads.md`](./workloads.md) — Workload Controllers: Deployment, StatefulSet, and DaemonSet
   - Deployment: Fungible Pods, No Identity
     - Update Flow
+    - Configuring Zero-Downtime Rollouts
     - Rollback Flow
     - Rollback History
     - Update/Rollback Summary
@@ -226,6 +227,7 @@ Kept in sync whenever a doc is created or a section is added — see
     - What Triggers Pod Replacement (and What Doesn't)
     - Graceful Termination During Rollout: preStop and `terminationGracePeriodSeconds`
     - Detecting a Stuck Rollout: `progressDeadlineSeconds`
+    - Argo Rollouts: Closing the Observation Gap
     - Rolling Update: What to Watch For
   - StatefulSet: Stable Identity for Clustered / Data-Bearing Workloads
     - Pod identity
