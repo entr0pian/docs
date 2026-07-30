@@ -164,6 +164,34 @@ Triggered by a client (e.g., `kubectl drain`) via the Eviction API. It is a volu
 kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
 ```
 
+### PodDisruptionBudget: How "Voluntary" Is Actually Checked
+
+The reason PDBs exist: a node drain, a cluster-autoscaler scale-down, or a
+manual eviction are all **proactive, plannable** actions, unlike a node
+crashing or an OOM kill — so something can check first whether doing so is
+safe. That check is what a PDB is.
+
+The mechanism is narrower than "any voluntary pod removal," though: a PDB
+is enforced **only** at the Eviction API — the `pods/eviction` subresource.
+`kubectl drain`, cluster-autoscaler, and any other caller that goes through
+that subresource get checked against `status.disruptionsAllowed`; a request
+that would push a matching group of Pods below the budget is rejected with
+HTTP `429`. A Deployment's own ReplicaSet controller scaling down old Pods
+during a rollout does **not** go through this path — it's a direct Pod
+`delete`, the same call used in the `What Triggers Pod Replacement` table in
+`workloads.md`. **PDBs are never consulted there.** A rollout's pace is
+governed solely by its own `maxSurge`/`maxUnavailable`.
+
+`status.disruptionsAllowed` isn't a ledger of who's allowed to disrupt what
+— it's continuously recomputed from **live Pod health** (how many Pods
+matching the selector are currently `Ready`, against the budget), with no
+memory of *why* a Pod became unavailable. Practical consequence: a
+Deployment rollout dropping `currentHealthy` can transiently zero out
+`disruptionsAllowed` for Pods sharing that PDB, causing an unrelated,
+concurrent node drain to get `429`'d and back off until the rollout's new
+Pods go Ready and health recovers — two unrelated voluntary-disruption paths
+contending over the same live number.
+
 ### Node-Pressure Eviction (Kubelet-Initiated)
 
 The `kubelet` monitors Node resource consumption and evicts Pods when thresholds are crossed to protect Node stability.
@@ -236,7 +264,7 @@ shutdown handling).
 
 - **Preemption vs. Eviction** — preemption is scheduler-driven to place a pending Pod; eviction is kubelet-driven to protect a running Node.
 - **PriorityClass affects both** — higher-priority Pods are harder to preempt and harder to evict under node pressure.
-- **PodDisruptionBudgets** protect against voluntary eviction but provide only a soft guarantee during node-pressure eviction.
+- **PodDisruptionBudgets** gate the Eviction API path specifically (drains, autoscaler scale-down) — not a controller's own direct Pod deletes (e.g. a Deployment rollout scaling down its old ReplicaSet) — and provide only a soft guarantee during node-pressure eviction.
 - **Resource requests matter** — they are the primary input to both the scheduling decision and the kubelet's eviction ordering.
 - **Pod GC vs. the other removal paths** — eviction and preemption remove a Pod from a Node that still exists, expecting a replacement (if any) to land elsewhere; Pod GC cleans up after the Node itself is gone. `nodeName`'s immutability is exactly why that cleanup has to be a deletion, not a reassignment.
 
@@ -245,14 +273,21 @@ shutdown handling).
 This covers the scheduling cycle (filtering, scoring, binding) and the
 mechanisms that influence it, the three `NodeResourcesFit` scoring
 strategies, preemption and its PDB interaction, the two standard eviction
-paths plus the `NoExecute`-taint path, and Pod GC's role in cleaning up
-Pods orphaned by Node deletion.
+paths plus the `NoExecute`-taint path, PodDisruptionBudget's actual
+enforcement point (the Eviction API subresource, not a controller's direct
+Pod deletes) and its live-health-based `disruptionsAllowed` recompute — including
+the concrete case of a Deployment rollout and a node drain contending over
+the same PDB — and Pod GC's role in cleaning up Pods orphaned by Node
+deletion.
 
 Not yet covered: scheduler extenders and running multiple schedulers in one
 cluster; the full default scoring plugin set beyond `NodeResourcesFit`,
 `PodTopologySpread`, and `ImageLocality`; the descheduler (a separate,
 non-core project that actively rebalances already-*running* Pods — distinct
 from everything here, which only acts at specific trigger points: creation,
-pressure, or an explicit request); and PodGC's other two responsibilities
+pressure, or an explicit request); PodGC's other two responsibilities
 (terminated-Pod capping, `out-of-service` taint handling) in any real
-detail.
+detail; and how a PDB's `OrderedReady` interaction plays out for a
+StatefulSet under *involuntary* disruption specifically (a node drain hitting
+a quorum-sensitive ensemble), as opposed to the voluntary-vs-voluntary
+rollout/drain race covered above.

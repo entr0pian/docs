@@ -99,3 +99,70 @@ App deadlocks — process alive, memory flat, no response to requests
 `readinessProbe` protects **traffic** from a broken Pod. `livenessProbe` protects the **Pod** from itself. They are not redundant, and one cannot substitute for the other — a Pod with only a `readinessProbe` has no self-healing path for a hang, deadlock, or any failure mode that doesn't also trip the kernel's OOM killer or cause the process to actually exit.
 
 ---
+
+## startupProbe and the No-Probe Defaults
+
+### What Happens With No Probes at All
+
+Neither probe defaults to "off" in a safe direction — both default to the
+most permissive possible answer, immediately:
+
+- **No `readinessProbe`:** the kubelet doesn't run a check and doesn't wait.
+  The container is marked `Ready` the instant it enters `Running`. For a
+  Pod newly added by a rollout, that means it can land in the Service's
+  EndpointSlice — and start receiving traffic — before the application
+  inside has finished initializing (config load, connection pool warm-up,
+  cache hydration), regardless of how long that actually takes.
+- **No `livenessProbe`:** the kubelet assumes `Success` forever, for as
+  long as the process doesn't exit on its own. This is exactly the
+  no-self-healing gap the deadlock example above walks through.
+
+### startupProbe vs. a Large `initialDelaySeconds`
+
+A slow-starting container needs *some* grace period before liveness/readiness
+checks start counting against it. The naive fix — a large
+`livenessProbe.initialDelaySeconds` — has two problems `startupProbe` solves:
+
+1. **It's a fixed wait, not an adaptive one.** Every restart pays the full
+   delay, even ones that come up in a second. `startupProbe` succeeds and
+   hands off to liveness/readiness as soon as the app is actually ready,
+   fast or slow.
+2. **It couples your startup budget to your steady-state detection speed.**
+   To tolerate a worst-case slow start with `initialDelaySeconds` alone, you
+   either accept that same long delay before liveness engages every time, or
+   you loosen `periodSeconds`/`failureThreshold` to cover it — which slows
+   down how fast a *real* deadlock gets caught once the app is actually
+   running. `startupProbe` has its own, separate `periodSeconds` ×
+   `failureThreshold` budget for startup, entirely decoupled from
+   `livenessProbe`'s steady-state cadence:
+
+```yaml
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  periodSeconds: 10
+  failureThreshold: 30   # up to 300s to come up, checked every 10s
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 2    # once running: a real deadlock is caught in 10s
+```
+
+While `startupProbe` is running, the kubelet does not run `livenessProbe` or
+`readinessProbe` at all — not just suppresses their *effect*, doesn't
+execute them. Only once `startupProbe` succeeds (or the field is omitted
+entirely) do the other two take over on their own configured cadence.
+
+### Not Yet Covered
+
+`startupProbe` behavior in a multi-container Pod (does one container's slow
+start hold up the others' liveness/readiness, or is each container's probe
+state independent); `minReadySeconds` — the Deployment-level gap between a
+Pod passing its `readinessProbe` and actually counting toward
+`maxUnavailable`/`Available` bookkeeping during a rollout, which is a
+related but separate mechanism from anything here.
+
+---

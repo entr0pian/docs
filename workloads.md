@@ -98,6 +98,50 @@ Active RS:  myapp-6f4c9b77d   →   3 × nginx:2.0
 Old RS:     myapp-7d6f5d8b7   →   0 pods  (retained for rollback history)
 ```
 
+### Configuring Zero-Downtime Rollouts
+
+The example above (`maxSurge: 1, maxUnavailable: 1`) lets the pool of
+serving Pods dip to 2 out of 3 mid-rollout — `maxUnavailable: 1` explicitly
+permits that. Zero-downtime is a specific, narrower configuration:
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+```
+
+```
+Start       Old RS = 3   New RS = 0                     (serving: 3)
+Step 1      Old RS = 3   New RS = 1   (total: 4, surge)  (serving: 3)
+            ↳ new Pod created, not yet Ready — doesn't count as serving,
+              and maxUnavailable: 0 means no old Pod may be removed yet
+            ↳ wait until the new Pod is Ready
+Step 2      Old RS = 2   New RS = 1   (total: 3)          (serving: 3)
+            ↳ now that a new Pod is confirmed Ready, one old Pod is safe
+              to remove — repeat: surge one, wait for Ready, retire one
+...
+Final       Old RS = 0   New RS = 3                       (serving: 3)
+```
+
+**Why it's `maxUnavailable: 0` that actually does the work, not
+`maxSurge`:** surge only controls how much *extra* capacity is allowed
+above desired — it doesn't touch when old Pods get removed. It's
+`maxUnavailable: 0` that forbids removing an old Pod until a replacement
+has already proven itself Ready, which is what keeps the serving count
+pinned at desired throughout. `maxSurge: 1` on its own, with
+`maxUnavailable` left at a nonzero default, still allows old Pods to be
+torn down before their replacements are confirmed healthy.
+
+This guarantee is only as good as what "Ready" means for this Pod, though
+— it's entirely downstream of the mechanisms already covered: a
+`readinessProbe` that doesn't actually verify the app can serve traffic
+makes "zero downtime" a paper guarantee, and skipping the graceful
+termination sequence (`preStop` + `terminationGracePeriodSeconds`, further
+down) can still drop in-flight requests on the way out even though the Pod
+*count* never dipped.
+
 ### Rollback Flow
 
 **1. User Triggers Rollback**
@@ -281,6 +325,203 @@ The fix is an in-memory per-RS counter called an **expectation**:
 | `livenessProbe` failure | No — container restarts in place, same Pod/UID | Kubelet's job, not the RS's; `restartPolicy: Always` is mandatory for controller-owned Pods |
 | `readinessProbe` failure | No | Pod is pulled from the Service's EndpointSlice; RS still sees it as `Running`/non-terminal |
 | Node-pressure eviction | Yes | Kubelet deletes the whole Pod to protect the Node; same delete-detection path as any other deletion |
+
+### Graceful Termination During Rollout: preStop and `terminationGracePeriodSeconds`
+
+When the old ReplicaSet scales down a Pod (or a Pod is deleted for any other
+reason), the actual sequence is **serial, not concurrent**:
+
+```
+1. Pod gets a deletion timestamp (Terminating)
+2. Pod is pulled from the Service's EndpointSlice — near-immediate,
+   but propagation to kube-proxy/iptables/ipvs across every Node,
+   or to an external LB's health-check cycle, still takes real time
+3. kubelet runs the preStop hook, if defined
+     ↳ the container has NOT received SIGTERM yet — it's still running
+       completely normally, unaware anything is happening
+4. Only after preStop completes (or times out) does the kubelet send SIGTERM
+5. The app's own shutdown logic runs: stop accepting new connections,
+   drain in-flight requests, release resources
+6. SIGKILL if terminationGracePeriodSeconds elapses before the process exits
+```
+
+Step 2 and step 4 are separated by however long propagation actually takes —
+which is exactly the gap a `preStop` sleep exists to bridge. Nothing about
+the app changes during that sleep; it's still fully serving, so any request
+that lands on it during that window is handled normally. `SIGTERM`, and the
+app's own graceful-shutdown logic, only start afterward:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["sleep", "5"]
+terminationGracePeriodSeconds: 30   # must cover preStop (5s) + app drain time
+```
+
+```
+t=0   Pod marked Terminating, pulled from EndpointSlice
+t=0   preStop sleep starts — no SIGTERM yet, app unaffected
+t=5   preStop finishes — propagation has had time to catch up
+t=5   SIGTERM sent → app's shutdown handler runs (stop new conns, drain in-flight)
+t=?   process exits cleanly, or...
+t=30  terminationGracePeriodSeconds deadline → SIGKILL regardless of state
+```
+
+`terminationGracePeriodSeconds` has to cover **both** phases — the `preStop`
+duration and the app's own post-`SIGTERM` drain time — or the kubelet kills
+the process mid-shutdown.
+
+### Detecting a Stuck Rollout: `progressDeadlineSeconds`
+
+**The scenario:** `myapp`, `replicas: 3`, `maxSurge: 1, maxUnavailable: 0`.
+Someone ships `nginx:2.0`, and it crash-loops on startup — a bad config
+value the container never recovers from.
+
+```
+t=0     kubectl apply → new RS myapp-6f4c9b77d created (nginx:2.0)
+          → RS creation is itself progress → Progressing condition's
+            lastUpdateTime = t=0
+t=0+ε   New RS scales to 1 (the one surge Pod maxSurge: 1 allows)
+          → updatedReplicas: 0 → 1 → progress observed → lastUpdateTime = t=0+ε
+t=1     Pod scheduled, container starts, crashes → kubelet restarts it →
+          CrashLoopBackOff. Pod never reaches Ready.
+t=1..599  Old RS pinned at 3 — maxUnavailable: 0 forbids scaling it down
+          until a new Pod is Ready, and none ever is. New RS pinned at 1,
+          that one Pod endlessly restarting. Every sync recomputes the same
+          numbers. No further progress. lastUpdateTime stays frozen at t=0+ε.
+t=600   600s since the last real movement, with none since → deadline
+          exceeded → Progressing: status=False, reason=ProgressDeadlineExceeded
+```
+
+**What actually counts as "progress":** every sync, the controller
+recomputes the Deployment's status from the pod informer cache — the same
+recompute-from-scratch pattern as `syncReplicaSet` above, just one level up
+— and compares four numbers against what it last recorded:
+`.status.updatedReplicas`, the old-Pod count (`.status.replicas -
+.status.updatedReplicas`), `.status.readyReplicas`, and
+`.status.availableReplicas`. Progress is any one of:
+
+- `updatedReplicas` went up — a new-template Pod was created
+- the old-Pod count went down — an old Pod was removed
+- `readyReplicas` went up — some Pod, old or new, newly passed its
+  `readinessProbe`
+- `availableReplicas` went up — some Pod stayed Ready long enough to clear
+  `minReadySeconds` (the still-open thread from earlier)
+
+Any one of those moving forward resets `lastUpdateTime` on the
+`Progressing` condition to now. That's the actual timer — not a countdown
+from when the rollout started, a rolling window since the last positive
+movement in one of these four counters. In the scenario above, that window
+never gets refreshed after `t=0+ε` because nothing moves again.
+
+**What changes in status once it trips:**
+
+```
+$ kubectl describe deployment myapp
+...
+Conditions:
+  Type           Status  Reason
+  ----           ------  ------
+  Available      True    MinimumReplicasAvailable
+  Progressing    False   ProgressDeadlineExceeded
+```
+
+```yaml
+# .status.conditions
+- type: Progressing
+  status: "False"
+  reason: ProgressDeadlineExceeded
+  message: 'ReplicaSet "myapp-6f4c9b77d" has timed out progressing.'
+  lastUpdateTime: "2026-07-30T10:10:00Z"
+  lastTransitionTime: "2026-07-30T10:10:00Z"
+```
+
+`lastTransitionTime` moves too here, not just `lastUpdateTime` — the
+condition's `status` itself flipped `True → False`, which is a transition,
+not just an update. Note `Available` can stay `True` through all of this:
+the 3 old Pods never stopped serving, so the Deployment is still available
+even though it's failed to progress.
+
+Crucially, this is **purely observational** — the Deployment and ReplicaSet
+controllers don't stop, pause, or roll back anything when the deadline
+passes; they keep reconciling toward the desired state exactly as before,
+still retrying the crash-looping Pod forever. The condition exists for
+external consumers to act on: `kubectl rollout status` polls it and exits
+non-zero (what makes a CI/CD deploy step fail on a stuck rollout), and
+Argo CD's built-in `Deployment` health check specifically looks for
+`Progressing`/`ProgressDeadlineExceeded` to mark an Application `Degraded`.
+Either way, *reverting* is a separate, manual step: `kubectl rollout undo`.
+
+### Argo Rollouts: Closing the Observation Gap
+
+One framing correction first: Argo Rollouts doesn't watch a Deployment from
+the outside and revert it — it's a separate CRD
+(`argoproj.io/v1alpha1, Kind: Rollout`) that **replaces** the Deployment
+resource entirely. You don't attach it to an existing Deployment; you
+migrate the workload to a `Rollout` object, and Argo Rollouts' own
+controller reconciles it instead of the built-in Deployment controller ever
+seeing it.
+
+What that buys you: a `Rollout` has the same `progressDeadlineSeconds`
+mechanics just described, but the Argo Rollouts controller actually *acts*
+on it — it can automatically abort the rollout and scale the stable
+ReplicaSet back to full traffic the instant the deadline trips, no external
+watcher required. It goes further with `AnalysisTemplate`/`AnalysisRun`:
+at each canary step it can query a metrics backend (e.g. a Prometheus
+error-rate query scoped to the new ReplicaSet's Pods) and treat a failing
+analysis as its own abort trigger — catching a rollout that's fully Ready
+and passing every probe but silently serving 500s, a failure mode
+`progressDeadlineSeconds` alone would never see.
+
+So the vanilla-Deployment version of "detect and revert" is really two
+separate things stitched together by hand: `Progressing`/
+`ProgressDeadlineExceeded` as the *detect* half, and a human or a CI step
+running `kubectl rollout undo` as the *revert* half. Argo Rollouts collapses
+both into the same controller loop.
+
+### Rolling Update: What to Watch For
+
+The mechanisms above, condensed into what actually has to be correct for a
+rolling update to be safe — each of these is a real, common way rollouts go
+wrong, not a hypothetical:
+
+1. **`readinessProbe` is not optional.** Without one, a new Pod enters the
+   EndpointSlice — and starts taking traffic — the instant its container is
+   `Running`, regardless of whether the app has actually finished
+   initializing (config load, connection pool warm-up, cache hydration).
+   Traffic hits it before it can serve. See
+   `pod_lifecycle_and_restarts.md`'s "startupProbe and the No-Probe
+   Defaults."
+2. **`livenessProbe` covers a failure mode readiness doesn't: a hang or
+   deadlock with no crash.** Without it, a deadlocked Pod just sits
+   `Running` / `READY 0/1` forever — nothing kills it, nothing replaces it.
+   See the same doc's "Readiness vs Liveness" section for the worked
+   example.
+3. **`startupProbe`, if startup time is slow or variable**, so a
+   `livenessProbe.initialDelaySeconds` generous enough to tolerate the
+   worst case doesn't also blunt how fast a *real* deadlock gets caught once
+   the app is actually running.
+4. **`maxSurge`/`maxUnavailable` decide an availability tradeoff, not just
+   rollout speed.** Only `maxUnavailable: 0` guarantees the Pod count
+   actually serving traffic never dips below desired replicas during the
+   rollout.
+5. **`preStop` + `terminationGracePeriodSeconds` on the way out**, or the
+   old Pod gets `SIGTERM`'d — and starts refusing/dropping connections —
+   before EndpointSlice removal has actually propagated through
+   kube-proxy/the LB. See "Graceful Termination During Rollout" above.
+6. **`progressDeadlineSeconds` reports a stuck rollout, it doesn't stop
+   one.** Nothing about the rollout changes when it trips — something has to
+   actually be watching `kubectl rollout status` or the `Progressing`
+   condition for a stuck rollout to get caught by anything other than a
+   human noticing traffic is degraded.
+7. **A `PodDisruptionBudget` doesn't protect a rollout from itself.** It
+   only gates the Eviction API (drains, cluster-autoscaler) — a
+   ReplicaSet's own scale-down deletes during a rollout are never checked
+   against it. Don't reach for a PDB expecting it to throttle your own
+   rollout; that's what `maxUnavailable` is for. See `scheduling.md`'s
+   "PodDisruptionBudget" section for what it actually protects against, and
+   how it can still stall an *unrelated* concurrent drain.
 
 ## StatefulSet: Stable Identity for Clustered / Data-Bearing Workloads
 
@@ -545,7 +786,19 @@ This covers Deployment's Pod-selection ranking, update/rollback flow across
 ReplicaSets, and the ReplicaSet controller's own reconcile loop (pod
 informer, ownerRef/selector adoption and orphaning, the expectations
 mechanism that prevents overshoot, and why it doesn't enforce template
-conformance on Pods that already exist); StatefulSet's three identity
+conformance on Pods that already exist); how `maxSurge`/`maxUnavailable`
+configure an actual zero-downtime rollout, and why it's specifically
+`maxUnavailable: 0` doing the work; graceful termination during a rollout
+(the `preStop`-before-`SIGTERM` ordering and why the gap matters) and
+`terminationGracePeriodSeconds`; how a stuck rollout is detected — a
+worked crash-loop example, the four status fields that count as "progress"
+and reset the deadline timer, and the exact `.status.conditions` diff once
+it trips — and why that detection is purely observational on a vanilla
+Deployment (`kubectl rollout status`, Argo CD's health check, and a manual
+`kubectl rollout undo` are the only things that act on it) versus Argo
+Rollouts, a separate controller/CRD that closes that gap by acting on the
+same signal (and richer metric-based analysis) automatically; StatefulSet's
+three identity
 mechanisms (Pod naming, per-ordinal PVCs via `volumeClaimTemplates`, per-Pod
 DNS via a headless Service) and why startup/shutdown ordering matters, split
 into the direction guarantee (bootstrap dependency) and the cardinality
@@ -554,21 +807,27 @@ count, per-node fixed node-affinity pinning via the normal scheduler, why a
 failed schedule never retries elsewhere, the cordon/drain exemption, and
 Node-deletion cleanup).
 
+How a `PodDisruptionBudget` interacts with a Deployment rollout — including
+why it's the Eviction API specifically that's gated, not the ReplicaSet's
+own scale-down deletes — is covered in `scheduling.md`'s Eviction section,
+where the PDB mechanism actually lives; the interaction with StatefulSet's
+`OrderedReady` during an *involuntary* disruption specifically is still
+open.
+
 Not yet covered: the exact slow-start batch sizes/cap for ReplicaSet Pod
 creation, and whether they differ for creates vs. deletes; how the
 Deployment controller's own reconcile loop decides step-by-step
 surge/unavailable counts across old and new RS during a rolling update —
-this doc shows the end states, not the per-step decision logic; how
-failover actually works once a StatefulSet primary dies (how a
-Patroni-style operator detects it and repoints the other replicas — the
-`primary_conninfo` mechanism above is only half the story);
-`persistentVolumeClaimRetentionPolicy` and what happens to PVCs when a
-StatefulSet itself (not just a Pod) is deleted or scaled down; partitioned
-rolling updates via `spec.updateStrategy.rollingUpdate.partition`
-(StatefulSet's canary-style mechanism, no Deployment equivalent); how a
-PodDisruptionBudget interacts with `OrderedReady` during *involuntary*
-disruption (a node drain), and how it gates the Eviction API path generally
-across all three controllers; DaemonSet's own update strategy
+this doc shows the end states, not the per-step decision logic;
+`minReadySeconds` and the gap it opens between a Pod passing `readinessProbe`
+and counting as `Available` for rollout bookkeeping; how failover actually
+works once a StatefulSet primary dies (how a Patroni-style operator detects
+it and repoints the other replicas — the `primary_conninfo` mechanism above
+is only half the story); `persistentVolumeClaimRetentionPolicy` and what
+happens to PVCs when a StatefulSet itself (not just a Pod) is deleted or
+scaled down; partitioned rolling updates via
+`spec.updateStrategy.rollingUpdate.partition` (StatefulSet's canary-style
+mechanism, no Deployment equivalent); DaemonSet's own update strategy
 (`RollingUpdate` vs `OnDelete`, `maxUnavailable`) — no ordinal concept at
 all, worth contrasting directly against StatefulSet's ordering; static Pods
 (kubelet-managed manifests), a mechanism people sometimes confuse with
