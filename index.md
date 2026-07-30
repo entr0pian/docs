@@ -155,6 +155,7 @@ Kept in sync whenever a doc is created or a section is added — see
 - [`pod_lifecycle_and_restarts.md`](./pod_lifecycle_and_restarts.md) — Pod & Container Lifecycle: Failures and Restarts
   - OOM Kills: Container Restart or Pod Recreation?
   - Readiness vs Liveness: Why Only One of Them Can Trigger a Restart
+  - startupProbe and the No-Probe Defaults
 
 - [`pv_and_pvcs.md`](./pv_and_pvcs.md) — Kubernetes Persistent Volumes (PV) & Persistent Volume Claims (PVC)
   - Core Concepts
@@ -193,6 +194,7 @@ Kept in sync whenever a doc is created or a section is added — see
     - Binding: Making the Decision Permanent
   - Preemption
   - Eviction
+    - PodDisruptionBudget: How "Voluntary" Is Actually Checked
   - Pod Garbage Collection
   - Key Interactions
   - What This Covers So Far
@@ -222,6 +224,8 @@ Kept in sync whenever a doc is created or a section is added — see
     - Why the ReplicaSet Doesn't Enforce Template Conformance on Existing Pods
     - Avoiding Overshoot: the Expectations Mechanism
     - What Triggers Pod Replacement (and What Doesn't)
+    - Graceful Termination During Rollout: preStop and `terminationGracePeriodSeconds`
+    - Detecting a Stuck Rollout: `progressDeadlineSeconds`
   - StatefulSet: Stable Identity for Clustered / Data-Bearing Workloads
     - Pod identity
     - Storage identity
