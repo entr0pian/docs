@@ -492,6 +492,95 @@ kubectl describe pv <name>    # check Finalizers and claimRef
 
 ---
 
+## Static Provisioning Walkthrough: A Local PV, `WaitForFirstConsumer`
+
+The GP3 walkthrough above is the dynamic-provisioning path. This is the other one: a PV that's **already fully formed** before any PVC exists, pinned to one specific node. Structurally different in one key way — there is no external-provisioner in this path at all, nothing ever calls `CreateVolume`.
+
+### The setup
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: local-pv-node7
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-fast
+  local:
+    path: /mnt/disks/ssd1
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [node-7]
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-fast
+provisioner: kubernetes.io/no-provisioner   # nothing dynamically creates local volumes
+volumeBindingMode: WaitForFirstConsumer
+```
+
+`local-pv-node7` was created by an admin (or a helper like the community `local-static-provisioner`, which just automates writing PV manifests like this one for disks it discovers — it doesn't change anything about the binding mechanics below). Its `nodeAffinity` is the load-bearing field: the data physically only exists on `node-7`.
+
+### What `WaitForFirstConsumer` is actually deferring here
+
+With no provisioning step, it isn't "wait for a volume to be created." It's "don't let the PV controller's normal eager static bind-by-search run before the scheduler has weighed in." Under `Immediate`, the moment the PVC is created, the PV controller would run its ordinary static matching logic (`storageClassName` + `accessModes` + capacity — the same search described in "Binding Process" above), find `local-pv-node7` as the only match, and bind it — before anyone has checked whether a pod can actually land on `node-7`. `WaitForFirstConsumer` holds that bind back specifically so the scheduler can treat the PV's `nodeAffinity` as an input to scheduling, not a constraint discovered after the fact.
+
+### The sequence
+
+```
+1. local-pv-node7 already exists, Available, nodeAffinity: node-7,
+   storageClassName: local-fast
+       │
+       ▼
+2. PVC "data" created, storageClassName: local-fast, no volumeName.
+   WaitForFirstConsumer → PV controller takes no action.
+   PVC stays Pending: "waiting for first consumer to be created
+   before binding" — same condition as the dynamic case, same reason:
+   nothing tries to bind an unconsumed WaitForFirstConsumer PVC
+       │
+       ▼
+3. Pod "app" created, references PVC "data"
+       │
+       ▼
+4. Scheduler's Filter phase runs, per candidate node, jointly with
+   every other filter (resources, taints, affinity). For THIS pod's
+   unbound PVC, the VolumeBinding plugin asks per node: "is there an
+   Available PV of this StorageClass whose nodeAffinity permits this
+   node?"
+     - node-5, node-12, etc. → no matching PV → fail Filter
+     - node-7 → local-pv-node7 matches → passes Filter
+   (If more than one local PV existed on different nodes, more than
+   one node would pass here, and Scoring would pick among them.)
+       │
+       ▼
+5. Reserve: plugin assumes local-pv-node7 ↔ PVC "data" in its cache
+       │
+       ▼
+6. PreBind: unlike the dynamic case, there's no external-provisioner
+   to wait on — the scheduler's own PreBind step performs the real
+   bind directly: sets PV.spec.claimRef and PVC.spec.volumeName
+   itself. Both flip to Bound immediately, no separate controller
+   round-trip needed
+       │
+       ▼
+7. Pod "app" bound to node-7, kubelet mounts /mnt/disks/ssd1
+```
+
+### Why `Immediate` would be worse here than for zonal EBS
+
+Suppose `node-7` itself fails Filter for an unrelated reason — it's tainted, or out of CPU. Under `WaitForFirstConsumer`, *every* node fails Filter (the others for lacking a matching PV, node-7 for its own reason), so Reserve/PreBind never run. The PVC never binds, `local-pv-node7` never gets a `claimRef`. The pod sits in an ordinary, self-healing `Pending` — the ordinary "didn't find available persistent volumes to bind" case. The instant node-7's problem clears, the next scheduling attempt just succeeds, with no operator involved.
+
+Under `Immediate`, the PV controller would have bound `local-pv-node7` to the PVC the moment the PVC was created — before anyone knew node-7 had a problem. The pod is stuck Pending exactly the same either way, but now the PV is also **permanently locked** to a PVC that can never actually be scheduled. There's no second local PV to fall back to (unlike the zonal-EBS `Immediate` pitfall, where other nodes in the zone might still work) — recovering requires an operator to notice, delete the PVC, and manually clear `claimRef` per the "Reusing a PV" procedure above. `WaitForFirstConsumer` doesn't prevent the scheduling failure in this scenario — it changes the failure mode from *a silently wasted, manually-recoverable PV* to *an ordinary, self-healing Pending pod*.
+
+---
+
 ## Mental Model
 
 ```
@@ -523,4 +612,4 @@ Something stuck Pending?   → check the full chain: PV → PVC → Pod
 
 ## What This Covers So Far
 
-This covers the PV/PVC binding model and its controller (`kube-controller-manager`'s PV controller), static vs. dynamic provisioning, reclaim policies and the manual `Retain`-reuse procedure, the finalizer-driven pending/terminating cascades, and — in depth — `volumeBindingMode`'s two values, the `Immediate` zone-affinity-conflict pitfall, and the full dynamic-provisioning sequence for a `WaitForFirstConsumer` GP3 PVC across all four actors (scheduler's `VolumeBinding` plugin, external-provisioner, CSI driver, PV controller). It doesn't yet cover the case flagged during that walkthrough: `WaitForFirstConsumer` applied to a **statically-provisioned local PV**, where there's no external-provisioner step at all — the disk already exists, pinned to one specific node via `nodeAffinity`, set by whoever created the PV up front. What does the `VolumeBinding` plugin actually do differently there — where does "waiting" come from with nothing to provision, and how does node selection work when the pod's other constraints have to somehow line up with wherever that one physical disk already lives? That's the seed for the next session on this doc. It also doesn't cover StorageClass fields beyond `provisioner` and `volumeBindingMode` (`allowVolumeExpansion`, `allowedTopologies`, `mountOptions`), or what happens on `CreateVolume` failure/retry (exponential backoff, event surfacing on the PVC).
+This covers the PV/PVC binding model and its controller (`kube-controller-manager`'s PV controller), static vs. dynamic provisioning, reclaim policies and the manual `Retain`-reuse procedure, the finalizer-driven pending/terminating cascades, and — in depth — `volumeBindingMode`'s two values, the `Immediate` zone-affinity-conflict pitfall, the full dynamic-provisioning sequence for a `WaitForFirstConsumer` GP3 PVC across all four actors (scheduler's `VolumeBinding` plugin, external-provisioner, CSI driver, PV controller), and the static-provisioning counterpart for a local PV — where `Filter` runs the node-affinity match per candidate node instead of a provisioner reacting to an annotation, and the scheduler's own `PreBind` step performs the bind directly since there's no external actor to wait on. It doesn't yet cover StorageClass fields beyond `provisioner` and `volumeBindingMode` (`allowVolumeExpansion`, `allowedTopologies`, `mountOptions`), what happens on `CreateVolume` failure/retry (exponential backoff, event surfacing on the PVC), or how the community `local-static-provisioner` automates discovering and registering local disks as PVs versus the fully manual creation shown above.

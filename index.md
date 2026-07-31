@@ -169,6 +169,7 @@ Kept in sync whenever a doc is created or a section is added — see
     - Scheduler and Volume Binding (`volumeBindingMode`, the `Immediate` zone-affinity pitfall)
     - Finalizers
   - Dynamic Provisioning Walkthrough: A GP3 PVC, End to End
+  - Static Provisioning Walkthrough: A Local PV, `WaitForFirstConsumer`
   - Mental Model
   - DevOps Takeaways
   - What This Covers So Far
