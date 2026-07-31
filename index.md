@@ -166,8 +166,13 @@ Kept in sync whenever a doc is created or a section is added — see
   - PV Lifecycle States
   - Reusing a PV with `reclaimPolicy: Retain`
   - Pod ↔ PVC ↔ PV Dependency and Pending States
+    - Scheduler and Volume Binding (`volumeBindingMode`, the `Immediate` zone-affinity pitfall)
+    - Finalizers
+  - Dynamic Provisioning Walkthrough: A GP3 PVC, End to End
+  - Static Provisioning Walkthrough: A Local PV, `WaitForFirstConsumer`
   - Mental Model
   - DevOps Takeaways
+  - What This Covers So Far
 
 - [`requests_vs_limits.md`](./requests_vs_limits.md) — Kubernetes: Requests vs Limits
   - Definitions
