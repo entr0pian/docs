@@ -324,6 +324,55 @@ Contrast that with the `Immediate` failure message above — that one comes from
 
 ---
 
+## Access Modes: `ReadWriteOnce`, `ReadOnlyMany`, `ReadWriteMany`, `ReadWriteOncePod`
+
+`accessModes` is a field on both PVC (requested) and PV (offered) — the "Binding Requirements" table above already notes that a PVC's requested modes must be a subset of the PV's. What that table doesn't say is that **each mode is a capability contract enforced by a different actor, at a different point in the pipeline** — not a hint passed to the CSI driver about what kind of volume to create (that's `parameters`, e.g. `type: gp3`).
+
+### The four modes
+
+| Mode | Common backing example | What it actually guarantees |
+|---|---|---|
+| `ReadWriteOnce` (RWO) | EBS, GCE PD — any single-attach block device | Read-write, but the backend can physically only attach to one **node** at a time |
+| `ReadOnlyMany` (ROX) | EFS, NFS-style backends | Read-only, concurrently, from any number of nodes |
+| `ReadWriteMany` (RWX) | EFS, NFS-style backends | Read-write, concurrently, from any number of nodes — requires a backend that supports true multi-writer semantics at the protocol level |
+| `ReadWriteOncePod` (RWOP) | Same backends as RWO | Read-write, but restricted to exactly one **pod** cluster-wide — closes a gap RWO leaves open |
+
+### Enforcement: which controller, at what point
+
+| Mode | Enforced by | Point in the pipeline | Mechanism |
+|---|---|---|---|
+| RWO | Attach/detach controller (`kube-controller-manager`) + CSI `external-attacher` sidecar | Node-level only, via `VolumeAttachment` objects | Refuses to attach the volume to a second node while already attached elsewhere |
+| ROX | kubelet | Local `mount` call on the node | Passes the `ro` flag at mount time — backend permissions and the volume itself are untouched, this is purely local |
+| RWX | Nobody in Kubernetes — the backend protocol itself | `CreateVolume`/`ControllerPublishVolume`, at the CSI driver | The driver reports (or refuses) the `MULTI_NODE_MULTI_WRITER` capability; EBS's driver rejects it outright, EFS's driver supports it because NFS does |
+| RWOP | **kube-apiserver admission** | Pod creation — before the pod ever reaches the scheduler | Rejects a new pod referencing a PVC that's already in use by another pod, cluster-wide |
+
+RWOP is the odd one out: it's the only mode enforced by the API server itself rather than by a controller loop or a CSI sidecar — and it has to work that way, because the gap it closes exists *before* scheduling and attachment ever happen.
+
+### Common Pitfall: A `Deployment` Sharing an RWO PVC
+
+`Deployment` has no `volumeClaimTemplates` — that's `StatefulSet`-only (see `workloads.md`'s "Storage identity" section). So a `Deployment` with `replicas: 2` that wants persistent storage at all can only do it by hardcoding the *same* PVC name into every replica's pod template. That single decision creates two very different failure modes depending on where the scheduler happens to put the second replica.
+
+**Scenario A — replicas land on different nodes (the common case, fails loudly):**
+
+```
+kubectl describe pod <replica-2>
+# Warning  FailedAttachVolume
+Multi-Attach error for volume "pvc-1234" Volume is already exclusively
+attached to one node and can't be attached to another
+```
+
+The attach/detach controller is doing exactly its job here — it's already attached the volume to replica 1's node and won't attach it to a second one. Replica 2 sits in `ContainerCreating` indefinitely. Annoying, but safe: no corruption, and the cause is obvious from `kubectl describe`.
+
+**Scenario B — replicas land on the same node (the dangerous case, fails silently):**
+
+RWO's exclusivity guarantee is node-scoped, not pod-scoped — nothing prevents the scheduler from placing both replicas on the same node in the first place. When that happens, kubelet just bind-mounts the same volume path into both containers. No attach conflict (it's one node, one attach), no admission rejection (RWO doesn't check pod identity), no error anywhere. Two processes now have concurrent read-write access to the same filesystem, and whether that corrupts anything depends entirely on whether the application was written to coordinate that itself — which most stateful software (databases, etcd, Kafka brokers) is not.
+
+This is precisely why `ReadWriteOncePod` had to be added as a *new*, fourth mode rather than just tightening the existing behavior of RWO — changing RWO's own semantics after the fact would have been a breaking change for every existing workload relying on "any pod on this node can mount it." RWOP is opt-in specifically for workloads that need the harder guarantee.
+
+The actual fix for this pitfall is architectural, not a flag: a truly single-instance stateful workload belongs on a `StatefulSet` (one PVC per replica, via `volumeClaimTemplates` — replicas can never collide on a volume because they never share one), and genuinely-concurrent access belongs on an RWX-capable backend (EFS), not RWO.
+
+---
+
 ## Dynamic Provisioning Walkthrough: A GP3 PVC, End to End
 
 This traces the exact sequence of controllers, informers, and API objects behind the common case: a PVC requesting `gp3` (AWS EBS) storage via a `WaitForFirstConsumer` StorageClass, referenced by a pod.
@@ -612,4 +661,4 @@ Something stuck Pending?   → check the full chain: PV → PVC → Pod
 
 ## What This Covers So Far
 
-This covers the PV/PVC binding model and its controller (`kube-controller-manager`'s PV controller), static vs. dynamic provisioning, reclaim policies and the manual `Retain`-reuse procedure, the finalizer-driven pending/terminating cascades, and — in depth — `volumeBindingMode`'s two values, the `Immediate` zone-affinity-conflict pitfall, the full dynamic-provisioning sequence for a `WaitForFirstConsumer` GP3 PVC across all four actors (scheduler's `VolumeBinding` plugin, external-provisioner, CSI driver, PV controller), and the static-provisioning counterpart for a local PV — where `Filter` runs the node-affinity match per candidate node instead of a provisioner reacting to an annotation, and the scheduler's own `PreBind` step performs the bind directly since there's no external actor to wait on. It doesn't yet cover StorageClass fields beyond `provisioner` and `volumeBindingMode` (`allowVolumeExpansion`, `allowedTopologies`, `mountOptions`), what happens on `CreateVolume` failure/retry (exponential backoff, event surfacing on the PVC), or how the community `local-static-provisioner` automates discovering and registering local disks as PVs versus the fully manual creation shown above.
+This covers the PV/PVC binding model and its controller (`kube-controller-manager`'s PV controller), static vs. dynamic provisioning, reclaim policies and the manual `Retain`-reuse procedure, the finalizer-driven pending/terminating cascades, `volumeBindingMode`'s two values and the `Immediate` zone-affinity-conflict pitfall, the four access modes and which distinct actor enforces each (attach/detach controller for RWO, kubelet for ROX, the CSI driver's own capability negotiation for RWX, kube-apiserver admission for RWOP) plus the `Deployment`-sharing-an-RWO-PVC pitfall in both its loud and silent forms, the full dynamic-provisioning sequence for a `WaitForFirstConsumer` GP3 PVC across all four actors (scheduler's `VolumeBinding` plugin, external-provisioner, CSI driver, PV controller), and the static-provisioning counterpart for a local PV — where `Filter` runs the node-affinity match per candidate node instead of a provisioner reacting to an annotation, and the scheduler's own `PreBind` step performs the bind directly since there's no external actor to wait on. It doesn't yet cover StorageClass fields beyond `provisioner` and `volumeBindingMode` (`allowVolumeExpansion`, `allowedTopologies`, `mountOptions`, and which of these are actually mutable post-creation vs. immutable), what happens on `CreateVolume` failure/retry (exponential backoff, event surfacing on the PVC), the exact CSI `ControllerGetCapabilities` negotiation behind the RWX rejection, or how the community `local-static-provisioner` automates discovering and registering local disks as PVs versus the fully manual creation shown above.

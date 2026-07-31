@@ -168,6 +168,7 @@ Kept in sync whenever a doc is created or a section is added — see
   - Pod ↔ PVC ↔ PV Dependency and Pending States
     - Scheduler and Volume Binding (`volumeBindingMode`, the `Immediate` zone-affinity pitfall)
     - Finalizers
+  - Access Modes: `ReadWriteOnce`, `ReadOnlyMany`, `ReadWriteMany`, `ReadWriteOncePod`
   - Dynamic Provisioning Walkthrough: A GP3 PVC, End to End
   - Static Provisioning Walkthrough: A Local PV, `WaitForFirstConsumer`
   - Mental Model
