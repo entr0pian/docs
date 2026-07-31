@@ -289,17 +289,147 @@ kubectl get pvc
 
 ### Scheduler and Volume Binding
 
-The scheduler is responsible for placing a pod on a node. Storage availability is part of that decision.
-
-- For `volumeBindingMode: Immediate` — PVC binds as soon as it is created, independently of scheduling. The pod is placed on any node.
-- For `volumeBindingMode: WaitForFirstConsumer` — PVC binding is **deferred until a pod is scheduled**. The scheduler picks a node first, then the PV is provisioned or selected based on that node's topology (important for local volumes and zone-aware storage).
+`volumeBindingMode` is a field on the **StorageClass**, and it has exactly two possible values. It controls *when*, relative to pod scheduling, a PVC gets bound (and, for dynamic provisioning, when the underlying volume gets created).
 
 | Binding Mode | PV Provisioned When | Use Case |
 |---|---|---|
-| `Immediate` | PVC is created | Cloud block storage, NFS |
-| `WaitForFirstConsumer` | Pod is scheduled to a node | Local volumes, zone-pinned storage |
+| `Immediate` | As soon as the PVC is created — before any pod exists | Storage with no topology constraints (e.g. NFS) |
+| `WaitForFirstConsumer` | After a pod referencing the PVC is scheduled to a node | Zone-pinned cloud block storage (EBS, GCE PD), local volumes |
 
-> Scheduling and volume binding are interconnected — a wrong binding mode for local storage can cause pods to be scheduled on nodes where the volume doesn't exist.
+#### The `Immediate` pitfall: zone affinity conflict
+
+Cloud block storage (EBS, GCE PD) is created in a single zone and cannot move. With `Immediate`, the volume is provisioned the moment the PVC is created — the CSI provisioner has no idea which node the pod will eventually land on, so it picks a zone with no scheduling context at all.
+
+If the scheduler then needs to place the pod on a node in a *different* zone (due to taints, affinity, capacity, or simple bad luck), it can't — the disk isn't there. The pod sticks in `Pending` with:
+
+```
+0/6 nodes are available: 6 node(s) had volume node affinity conflict.
+```
+
+This isn't self-healing. The PV's `nodeAffinity` (set to the zone it was created in) never changes, so the fix is to delete the PVC (and, depending on `reclaimPolicy`, the PV) and let it re-provision — there's no way to move an already-created EBS volume to another zone via Kubernetes.
+
+#### `WaitForFirstConsumer` closes the gap
+
+Binding — and for dynamic provisioning, volume creation itself — is deferred until a pod that references the PVC is scheduled. The scheduler picks the node *first*, using its normal constraints, and only then does provisioning happen, scoped to that node's zone. This is implemented as a distinct field on the PVC object, not just a delay: a `volume.kubernetes.io/selected-node` **annotation**, written by the scheduler's `VolumeBinding` plugin once it tentatively reserves a node for the pod. See the walkthrough below for the exact sequence.
+
+Before any pod exists to trigger this, a PVC in this mode sits in `Pending` with a condition message that reflects intentional inaction, not failure:
+
+```
+waiting for first consumer to be created before binding
+```
+
+Contrast that with the `Immediate` failure message above — that one comes from the **scheduler**, evaluating a pod against a PVC that should already be bound. This one comes from the **PV controller**, evaluating a PVC on its own, before any pod has entered the picture.
+
+> Scheduling and volume binding are interconnected — a wrong binding mode for zone-pinned or local storage can cause pods to be scheduled on nodes where the volume doesn't or can't exist.
+
+---
+
+## Dynamic Provisioning Walkthrough: A GP3 PVC, End to End
+
+This traces the exact sequence of controllers, informers, and API objects behind the common case: a PVC requesting `gp3` (AWS EBS) storage via a `WaitForFirstConsumer` StorageClass, referenced by a pod.
+
+### The players
+
+Kubernetes doesn't provision or attach storage itself — it defines the **Container Storage Interface (CSI)**, an interface analogous to the CRI that `kubelet.md` covers for container runtimes: core Kubernetes owns the contract, a vendor-supplied driver owns the implementation. For EBS, that driver is `ebs.csi.aws.com`.
+
+| Actor | Where it runs | What it watches | What it does |
+|---|---|---|---|
+| **Scheduler** (`VolumeBinding` plugin) | `kube-scheduler`, control plane | Pods being scheduled, PVCs they reference | Picks a candidate node; if a referenced PVC is unbound and `WaitForFirstConsumer`, stamps the PVC with the node choice and stalls the pod's own bind until the PVC resolves |
+| **external-provisioner** | CSI sidecar container, runs as a Deployment/StatefulSet pod installed alongside the EBS CSI driver | PVCs (via informer) | On seeing a PVC with a matching `storageClassName` and no `volumeName`, calls the driver's `CreateVolume` gRPC; on success, creates the PV object itself, with `spec.claimRef` pre-set to the requesting PVC |
+| **EBS CSI driver** | Container in the same pod as external-provisioner, talked to over a local Unix socket | N/A (gRPC server, not a watcher) | Implements `CreateVolume` — calls the AWS EC2 API to actually create the EBS volume, returns the volume ID |
+| **PV controller** | `kube-controller-manager`, control plane | PVs and PVCs (via informer) | Sees the new PV already carries a `claimRef`; sets `PVC.spec.volumeName` to match, flips both to `Bound`. No search/match logic runs here — that logic (line ~61 above) is for *static* provisioning only, where a PV really is unclaimed |
+
+### Manifests in play
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  storageClassName: gp3
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app
+spec:
+  containers: [...]
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: data
+```
+
+### The sequence
+
+```
+1. PVC "data" created, storageClassName: gp3, no volumeName
+       │
+       ▼
+2. external-provisioner's informer fires on the new PVC.
+   StorageClass says WaitForFirstConsumer + no selected-node
+   annotation yet → provisioner takes no action, PVC stays Pending
+   with condition "waiting for first consumer to be created before binding"
+       │
+       ▼
+3. Pod "app" created, references PVC "data"
+       │
+       ▼
+4. Scheduler begins the scheduling cycle for "app": Filter/Score
+   nodes on ordinary constraints (resources, taints, affinity —
+   NOT volume topology yet, there's no volume)
+       │
+       ▼
+5. VolumeBinding plugin's Reserve phase tentatively picks node N.
+   Writes annotation on the PVC:
+     volume.kubernetes.io/selected-node: N
+   Scheduler's PreBind phase now blocks, waiting on this PVC to
+   reach Bound — the pod is NOT yet bound to N
+       │
+       ▼
+6. external-provisioner's informer fires again on the PVC update.
+   Sees the selected-node annotation → calls CreateVolume via gRPC
+   to the EBS CSI driver, passing N's zone as a topology requirement
+       │
+       ▼
+7. EBS CSI driver calls the AWS EC2 API → EBS volume created in N's
+   zone → volume ID returned
+       │
+       ▼
+8. external-provisioner creates the PV object:
+     spec.csi.volumeHandle = <ebs-volume-id>
+     spec.claimRef = {name: data, namespace: ..., uid: ...}   ← pre-set here
+       │
+       ▼
+9. PV controller's informer fires on the new PV. claimRef already
+   names a specific PVC — no matching search needed. Sets:
+     PVC.spec.volumeName = <pv-name>
+   Both objects flip to Bound
+       │
+       ▼
+10. Scheduler's PreBind phase (blocked since step 5) sees the PVC
+    is Bound → unblocks → proceeds with the actual pod-to-node bind
+       │
+       ▼
+11. Pod "app" is bound to node N, kubelet starts the volume mount
+```
+
+The key structural insight: nothing here does an open-ended search for a match. Every step is a direct pointer to the next — the annotation names the node, `claimRef` names the PVC, `volumeName` names the PV. Matching-by-search is entirely a static-provisioning concern.
 
 ---
 
@@ -388,3 +518,9 @@ Something stuck Pending?   → check the full chain: PV → PVC → Pod
 - **Always inspect data before reusing** a released PV
 - **Always use `spec.volumeName`** when rebinding to a specific PV — never rely on automatic selection
 - **Static provisioning requires upfront capacity planning** — overprovisioned PVs waste storage
+
+---
+
+## What This Covers So Far
+
+This covers the PV/PVC binding model and its controller (`kube-controller-manager`'s PV controller), static vs. dynamic provisioning, reclaim policies and the manual `Retain`-reuse procedure, the finalizer-driven pending/terminating cascades, and — in depth — `volumeBindingMode`'s two values, the `Immediate` zone-affinity-conflict pitfall, and the full dynamic-provisioning sequence for a `WaitForFirstConsumer` GP3 PVC across all four actors (scheduler's `VolumeBinding` plugin, external-provisioner, CSI driver, PV controller). It doesn't yet cover the case flagged during that walkthrough: `WaitForFirstConsumer` applied to a **statically-provisioned local PV**, where there's no external-provisioner step at all — the disk already exists, pinned to one specific node via `nodeAffinity`, set by whoever created the PV up front. What does the `VolumeBinding` plugin actually do differently there — where does "waiting" come from with nothing to provision, and how does node selection work when the pod's other constraints have to somehow line up with wherever that one physical disk already lives? That's the seed for the next session on this doc. It also doesn't cover StorageClass fields beyond `provisioner` and `volumeBindingMode` (`allowVolumeExpansion`, `allowedTopologies`, `mountOptions`), or what happens on `CreateVolume` failure/retry (exponential backoff, event surfacing on the PVC).
