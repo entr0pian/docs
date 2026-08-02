@@ -143,6 +143,19 @@ Kept in sync whenever a doc is created or a section is added — see
   - Is There a Risk of Losing Logs?
   - Key Interactions
 
+- [`monitoring.md`](./monitoring.md) — Prometheus Monitoring: Scrape Architecture, kube-state-metrics, and the Operator
+  - Two Separate Systems, Not One
+  - The Three Scrape Targets Behind "Cluster Monitoring"
+  - Where node-exporter and kube-state-metrics Come From
+  - kube-state-metrics: How It Actually Produces a Metric
+  - How Prometheus Finds Its Targets
+  - The Prometheus Operator: Two Independent Label Matches
+    - Worked Example: How kube-state-metrics Gets Wired Up, End to End
+  - Debugging a Missing Target
+  - Bare Operator vs. kube-prometheus-stack
+  - Grafana: Pull, Not Push
+  - What This Covers So Far
+
 - [`pipeline_pattern.md`](./pipeline_pattern.md) — Pipeline Pattern in Go
   - What is a Pipeline?
   - A Simple Pipeline
