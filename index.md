@@ -56,13 +56,6 @@ Kept in sync whenever a doc is created or a section is added — see
   - How the Filters Work Together
   - Summary Table
 
-- [`cascading_deletion.md`](./cascading_deletion.md) — Cascading Deletion: Garbage Collection vs. Finalizers
-  - Mechanism 1: Owner References + The Garbage Collector
-  - Mechanism 2: Finalizers
-  - Worked Example: Same-Namespace Cascade — Deployment → ReplicaSet → Pod
-  - Worked Example: Cross-Namespace Cascade — ArgoCD Application → Managed Resources
-  - What This Covers So Far
-
 - [`concepts.md`](./concepts.md) — Kubernetes Concepts — Quick Reference
   - Deployment Strategy: RollingUpdate (default)
   - Probes
@@ -82,6 +75,14 @@ Kept in sync whenever a doc is created or a section is added — see
   - Drift Detection and Correction
   - Composition Field Reference
   - Composition Functions and Pipeline Mode
+
+- [`deletion.md`](./deletion.md) — Kubernetes Object Deletion
+  - Cascading Deletion: Garbage Collection vs. Finalizers
+    - Mechanism 1: Owner References + The Garbage Collector
+    - Mechanism 2: Finalizers
+    - Worked Example: Same-Namespace Cascade — Deployment → ReplicaSet → Pod
+    - Worked Example: Cross-Namespace Cascade — ArgoCD Application → Managed Resources
+  - What This Covers So Far
 
 - [`gitops_and_argocd.md`](./gitops_and_argocd.md) — GitOps & ArgoCD
   - Q&A format (older doc, predates the generic-file/subsection convention below); overlaps with `argocd.md` and `argocd_refresh_sync.md`. Topics covered: the GitOps model, ArgoCD's role, the reconciliation loop, `OperationState`, tracking/stopping a running sync, ArgoCD vs Jenkins/Tekton, handling manual prod changes, ArgoCD's architecture components, multi-cluster/multi-environment setup, `argocd cluster add` internals and security implications, custom resource health checks via Lua.

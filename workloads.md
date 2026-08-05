@@ -223,8 +223,8 @@ Ownership is resolved two ways:
   from the Deployment/RS without killing it.
 
 These same `ownerReferences` are what the garbage collector cascades
-through when a Deployment is deleted — `cascading_deletion.md` has the
-full Deployment → ReplicaSet → Pod trace, as one of two worked examples
+through when a Deployment is deleted — `deletion.md` has the full
+Deployment → ReplicaSet → Pod trace, as one of two worked examples
 contrasting that same-namespace, no-finalizer path against a
 cross-namespace case (an ArgoCD `Application`) that can't use it.
 

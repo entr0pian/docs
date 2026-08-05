@@ -1,4 +1,8 @@
-# Cascading Deletion: Garbage Collection vs. Finalizers
+# Kubernetes Object Deletion
+
+How deletion actually behaves — what makes it cascade to other objects, what makes it graceful, what makes it hang in `Terminating` — depends on which of a handful of independent, non-overlapping mechanisms is in play for a given object. This doc collects them, starting with the one that answers "when I delete this, what happens to everything it manages."
+
+## Cascading Deletion: Garbage Collection vs. Finalizers
 
 Deleting a parent object and having Kubernetes clean up everything it manages is not one mechanism — it's two independent, non-overlapping ones, and which one applies to a given object is decided entirely by whether that object has anything in `metadata.finalizers`. Confusing the two is the easiest way to misdiagnose "why didn't this get deleted."
 
@@ -9,7 +13,7 @@ The two worked examples below use one mechanism each, and the contrast between t
 
 ---
 
-## Mechanism 1: Owner References + The Garbage Collector
+### Mechanism 1: Owner References + The Garbage Collector
 
 An object with no finalizers is deleted immediately: the API server purges it from etcd on the spot and emits exactly one watch event, `DELETED`. That event is delivered to *every* controller with an informer on that resource type, indiscriminately — watch delivery doesn't know or care which recipient has something useful to do with it. A resource's own controller (e.g. the Deployment controller, watching Deployments for its actual job of shifting replicas between ReplicaSets during a rollout) typically receives this event and does nothing with it: its reconcile runs, `Get()` returns `NotFound`, and it returns immediately. There is no cleanup branch to run, because the object is already gone.
 
@@ -34,7 +38,7 @@ Two constraints fall directly out of this design:
 
 `blockOwnerDeletion: true` is a related but separate knob: it only matters if the delete is issued with `propagationPolicy: Foreground`, in which case Kubernetes puts its own built-in `foregroundDeletion` finalizer on the *owner* itself, so the owner can't leave etcd until GC finishes the dependents. The default `kubectl delete` uses `Background` policy — the owner vanishes immediately and dependent cleanup trails behind it, exactly as traced below.
 
-## Mechanism 2: Finalizers
+### Mechanism 2: Finalizers
 
 A finalizer is a string in `metadata.finalizers`. Its presence changes what a delete request does: instead of purging the object, the API server sets `metadata.deletionTimestamp` and performs an **update**, leaving the object alive in etcd. That generates a `MODIFIED` event, not `DELETED` — the object still exists, so any controller watching it can still read it. A controller that recognizes its own finalizer name reacts to `deletionTimestamp != nil` by running whatever cleanup it owns, then removes its name from the list via its own `Update()` call. Once the finalizers list is empty *and* `deletionTimestamp` is set, the API server performs the real delete, and the final `DELETED` event fires.
 
@@ -42,7 +46,7 @@ A finalizer is a string in `metadata.finalizers`. Its presence changes what a de
 
 ---
 
-## Worked Example: Same-Namespace Cascade — Deployment → ReplicaSet → Pod
+### Worked Example: Same-Namespace Cascade — Deployment → ReplicaSet → Pod
 
 Neither the Deployment, the ReplicaSet, nor the Pod carries a finalizer by default, so this is a pure Mechanism-1 cascade. A Deployment only owns its ReplicaSet directly — it has no `ownerReferences` relationship to the Pods at all — so GC has to walk two hops, not one:
 
@@ -78,7 +82,7 @@ GC issues: DELETE Pod myapp-6f4c9b77d-x2v9q  (one call per replica)
 
 **The last hop isn't instant, even though nothing here has a finalizer.** A Pod delete carries a default grace period, and the API server's delete handling for Pods special-cases that: it sets `deletionTimestamp`/`Terminating` and keeps the object alive in etcd rather than purging it outright — the sequence `workloads.md`'s "Graceful Termination During Rollout" section covers in full (EndpointSlice removal, `preStop`, `SIGTERM`, then `SIGKILL` at the grace-period deadline or kubelet-confirmed exit). GC's job ends at issuing the `DELETE` call — the kubelet and the API server's own grace-period handling carry out the rest. It's a second, unrelated deferred-deletion mechanism sitting at the very end of the chain, superficially similar to a finalizer ("stay alive until something finishes") but built into the Pod resource's delete strategy specifically, not into `metadata.finalizers`.
 
-## Worked Example: Cross-Namespace Cascade — ArgoCD Application → Managed Resources
+### Worked Example: Cross-Namespace Cascade — ArgoCD Application → Managed Resources
 
 `kubectl delete application taskapp-backend-prod` frequently surprises people: the `Application` object disappears, but the Deployment, Service, and everything else it managed keep running, untouched. That's the default, and it's a direct consequence of the namespace constraint above: an `Application` typically lives in the `argocd` namespace, and manages resources in an arbitrary destination namespace (`argocd.md` §3's `spec.destination.namespace`) — often several different ones across several Applications — and, in a multi-cluster setup, on an entirely different cluster (`spec.destination.server`) altogether. There is no `ownerReferences` entry that can express "my owner lives in a different namespace," so Mechanism 1 is structurally inapplicable here, independent of whether ArgoCD would even want automatic cascade as the default.
 
