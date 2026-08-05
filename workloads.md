@@ -222,6 +222,12 @@ Ownership is resolved two ways:
   one Pod for live debugging" trick: `kubectl label pod foo app-` strips it
   from the Deployment/RS without killing it.
 
+These same `ownerReferences` are what the garbage collector cascades
+through when a Deployment is deleted — `cascading_deletion.md` has the
+full Deployment → ReplicaSet → Pod trace, as one of two worked examples
+contrasting that same-namespace, no-finalizer path against a
+cross-namespace case (an ArgoCD `Application`) that can't use it.
+
 When a worker dequeues an RS key, `syncReplicaSet` does a **full recount
 from the local informer cache**: list every Pod matching the selector,
 filter to non-terminal ones (phase not `Succeeded`/`Failed`, no deletion
@@ -239,110 +245,6 @@ Two consequences worth being explicit about:
 - **The Pod template is consulted only when creating a replacement.** It
   plays no role in evaluating Pods that already exist and still match the
   selector — which is the subject of the next section.
-
-### Cascading Delete: How Deleting a Deployment Removes Its ReplicaSet and Pods
-
-Neither the Deployment nor the ReplicaSet nor the Pod carries anything in
-`metadata.finalizers` by default. That absence is the whole story for why
-`kubectl delete deployment myapp` cascades at all — and why it's a
-different mechanism from anything gated by a finalizer.
-
-**No finalizer means the delete is immediate, not deferred.** The API
-server doesn't set a `deletionTimestamp` and wait for anything — it purges
-the Deployment from etcd on the spot and emits exactly one watch event:
-`DELETED`. That event is delivered to every controller that has an
-informer on `Deployment` objects, indiscriminately — watch delivery
-doesn't know or care which recipient has something useful to do with it.
-
-**The Deployment controller is one of those recipients, and does nothing
-useful with it.** It watches Deployments for its actual job — shifting
-`.spec.replicas` between old and new ReplicaSets during a rollout (the
-Update Flow above) — not for cleanup. Its reconcile function runs,
-`Get(myapp)` returns `NotFound`, and it returns immediately. There is no
-deletion branch in this controller; it was never built to have one.
-
-**The controller that actually does the work is the garbage collector**
-(GC), a separate controller inside `kube-controller-manager` with its own
-informers spanning nearly every resource type in the cluster — not just
-Deployments. GC maintains a continuously-updated, in-memory graph keyed by
-UID, built from every object's `ownerReferences`. Critically, that graph
-edge already existed before the delete happened: when the Deployment
-controller originally created the ReplicaSet, it stamped it with
-
-```yaml
-ownerReferences:
-  - apiVersion: apps/v1
-    kind: Deployment
-    name: myapp
-    uid: 3f2a9e10-...
-    controller: true
-    blockOwnerDeletion: true
-```
-
-and GC's own informer recorded that edge (`myapp`'s UID → dependent
-`myapp-6f4c9b77d`) the moment it saw that `ADDED`/`MODIFIED` event, long
-before any deletion was in the picture. So when the Deployment's `DELETED`
-event lands, GC isn't searching — it's a graph lookup against a node it
-already has.
-
-**The cascade is a chain of hops, not one fan-out.** A Deployment only
-owns its ReplicaSet directly; it has no `ownerReferences` relationship to
-the Pods at all. So GC has to walk two levels, and each level is GC
-reacting to an event it generated on the previous one:
-
-```
-kubectl delete deployment myapp        (no finalizers on Deployment/RS/Pod)
-        │
-        ▼
-API server purges Deployment from etcd immediately — single DELETED event
-        │
-        ├──▶ Deployment controller's informer fires on the same event
-        │       → Get(myapp) → NotFound → returns, nothing to do
-        │
-        ▼
-GC's Deployment informer fires → graph lookup on myapp's UID → finds RS as
-a dependent (edge recorded back when the RS was created, not now)
-        │
-        ▼
-GC issues: DELETE ReplicaSet myapp-6f4c9b77d
-        │
-        ▼
-RS purged from etcd — its own DELETED event
-        │
-        ├──▶ ReplicaSet controller's informer fires on the same event
-        │       → Get(myapp-6f4c9b77d) → NotFound → returns, nothing to do
-        │
-        ▼
-GC's ReplicaSet informer fires → graph lookup on the RS's UID → finds every
-Pod it owns as dependents
-        │
-        ▼
-GC issues: DELETE Pod myapp-6f4c9b77d-x2v9q  (one call per replica)
-```
-
-**The last hop isn't instant, even though nothing here has a finalizer.**
-Unlike the Deployment and RS deletes above, a Pod delete carries a default
-grace period, and the API server's delete handling for Pods special-cases
-that: it sets `deletionTimestamp`/`Terminating` and keeps the object alive
-in etcd rather than purging it outright — the exact sequence already
-covered in "Graceful Termination During Rollout" above (EndpointSlice
-removal, `preStop`, `SIGTERM`, then `SIGKILL` at the grace-period deadline
-or kubelet-confirmed exit). GC's job ends at issuing the `DELETE` call —
-the kubelet and the API server's own grace-period handling carry out the
-rest. It's a second, unrelated deferred-deletion mechanism sitting at the
-very end of the chain — not the same finalizer mechanism, just a
-superficially similar "stay alive until something finishes" pattern baked
-into the Pod resource's delete strategy specifically.
-
-This whole path — GC walking a graph of `ownerReferences` it already had
-warm — only works because every object in the chain lives in the same
-namespace as its owner. `ownerReferences` carries no namespace field of
-its own; a namespaced object's owner is only ever resolved within that
-same namespace. That constraint is exactly what breaks down for something
-like an ArgoCD `Application`, which routinely manages resources in a
-namespace other than its own — see `argocd.md`'s "Cascading Delete"
-section for the finalizer-based mechanism that exists specifically to
-cover that gap.
 
 ### Why the ReplicaSet Doesn't Enforce Template Conformance on Existing Pods
 
@@ -890,12 +792,7 @@ This covers Deployment's Pod-selection ranking, update/rollback flow across
 ReplicaSets, and the ReplicaSet controller's own reconcile loop (pod
 informer, ownerRef/selector adoption and orphaning, the expectations
 mechanism that prevents overshoot, and why it doesn't enforce template
-conformance on Pods that already exist); how deleting a Deployment cascades
-to its ReplicaSet and Pods — the garbage collector walking an
-`ownerReferences` graph it already had warm, in two hops, versus the
-Deployment/ReplicaSet controllers' own no-op reconciles on the same
-`DELETED` events, and why the whole mechanism is bounded to a single
-namespace; how `maxSurge`/`maxUnavailable`
+conformance on Pods that already exist); how `maxSurge`/`maxUnavailable`
 configure an actual zero-downtime rollout, and why it's specifically
 `maxUnavailable: 0` doing the work; graceful termination during a rollout
 (the `preStop`-before-`SIGTERM` ordering and why the gap matters) and

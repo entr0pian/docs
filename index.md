@@ -25,7 +25,6 @@ Kept in sync whenever a doc is created or a section is added — see
   - 3. The Application Resource Tree — How Managed Resources Are Discovered
   - 4. Deep Dive: The Self-Heal / Drift-Detection Flow
   - 5. Application Health
-  - 6. Cascading Delete: When Deleting an Application Removes (or Doesn't Remove) Its Managed Resources
 
 - [`argocd_refresh_sync.md`](./argocd_refresh_sync.md) — ArgoCD: Refresh vs Sync
   - Core Loop
@@ -56,6 +55,13 @@ Kept in sync whenever a doc is created or a section is added — see
   - The Three Layers cAdvisor Measures
   - How the Filters Work Together
   - Summary Table
+
+- [`cascading_deletion.md`](./cascading_deletion.md) — Cascading Deletion: Garbage Collection vs. Finalizers
+  - Mechanism 1: Owner References + The Garbage Collector
+  - Mechanism 2: Finalizers
+  - Worked Example: Same-Namespace Cascade — Deployment → ReplicaSet → Pod
+  - Worked Example: Cross-Namespace Cascade — ArgoCD Application → Managed Resources
+  - What This Covers So Far
 
 - [`concepts.md`](./concepts.md) — Kubernetes Concepts — Quick Reference
   - Deployment Strategy: RollingUpdate (default)
@@ -242,7 +248,6 @@ Kept in sync whenever a doc is created or a section is added — see
     - Rollback History
     - Update/Rollback Summary
     - How the ReplicaSet Controller Actually Reconciles
-    - Cascading Delete: How Deleting a Deployment Removes Its ReplicaSet and Pods
     - Why the ReplicaSet Doesn't Enforce Template Conformance on Existing Pods
     - Avoiding Overshoot: the Expectations Mechanism
     - What Triggers Pod Replacement (and What Doesn't)
