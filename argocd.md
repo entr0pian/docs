@@ -216,4 +216,76 @@ Backend        (Lua)        → Healthy
 Application aggregate → Degraded
 ```
 
+---
+
+## 6. Cascading Delete: When Deleting an Application Removes (or Doesn't Remove) Its Managed Resources
+
+`kubectl delete application taskapp-backend-prod` frequently surprises people: the `Application` object disappears, but the Deployment, Service, and everything else it managed keep running, untouched. That's not a bug — it's the default, and understanding why requires contrasting it with how a built-in cascade like Deployment → ReplicaSet → Pod works (`workloads.md` has that full trace).
+
+### Why the native garbage collector can't do this job
+
+That built-in cascade runs entirely on `ownerReferences`, resolved by the Kubernetes garbage collector (GC). Critically, `ownerReferences` carries no namespace field — a namespaced object's owner is only ever resolved within that same namespace. An `Application` typically lives in the `argocd` namespace and manages resources in an arbitrary destination namespace (`spec.destination.namespace`) — often several different ones across several Applications — and, in a multi-cluster setup, on an entirely different cluster (`spec.destination.server`) altogether. There is no `ownerReferences` entry that could express "my owner lives in a different namespace," let alone a different cluster. GC's cascade mechanism is structurally inapplicable here, independent of whether ArgoCD would even want automatic cascade delete as the default.
+
+### The mechanism: a finalizer, and it's opt-in
+
+ArgoCD solves this the way `kubernetes_operators.md` §5 describes for any controller whose cleanup can't be expressed as a plain owner-reference graph: a **finalizer**, watched and acted on by the same `argocd-application-controller` that does normal sync reconciliation. The finalizer is `resources-finalizer.argocd.argoproj.io`, and — unlike the Deployment/RS/Pod case — it is **not present by default**:
+
+```yaml
+metadata:
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+```
+
+It gets onto the object one of three ways: the ArgoCD UI's delete dialog has a "cascade" toggle, checked by default, which PATCHes this finalizer onto the `Application` before issuing the delete; `argocd app delete <name> --cascade` does the same from the CLI; or it's simply committed into the Application's manifest in Git, in which case every delete of it cascades unconditionally. A bare `kubectl delete application` against an object that never had the finalizer set skips all of this — same fast, no-finalizer path as the Deployment case, just with no GC and no `ownerReferences` chain to fall back on, so the managed resources are simply orphaned.
+
+### Step by step, with the finalizer present
+
+```
+kubectl delete application taskapp-backend-prod
+   (finalizers: [resources-finalizer.argocd.argoproj.io] already present)
+        │
+        ▼
+API server: finalizers non-empty → sets deletionTimestamp, keeps the object
+in etcd — an UPDATE, not a delete; no DELETED event yet
+        │
+        ▼
+Application-CR informer (§4) fires MODIFIED → Application requeued
+        │
+        ▼
+Reconcile sees deletionTimestamp != nil → branches into deletion handling
+        │
+        ▼
+Walks the Application's resource tree (§3) — built from the tracking
+label/annotation for directly-applied resources, plus ownerReferences for
+transitively-discovered ones, kept warm by the cluster cache's watches (§4)
+— not re-listed now. This tree carries no namespace restriction; it was
+never built from ownerReferences alone.
+        │
+        ▼
+Issues DELETE against every resource in the tree, wherever it lives —
+whatever namespace, even whatever destination cluster
+        │
+        ▼
+Controller confirms, via the same cluster-cache watches, that every tracked
+resource is actually gone — not just that the DELETE calls returned 200
+        │
+        ▼
+Controller removes resources-finalizer.argocd.argoproj.io, r.Update()
+        │
+        ▼
+API server: finalizers now empty + deletionTimestamp already set → purges
+the Application from etcd → DELETED event fires
+```
+
+The confirm-before-finalizer-removal step matters: if the controller dropped the finalizer right after *issuing* the deletes, without checking they landed, a delete that silently failed (RBAC on the destination cluster, a target resource with its own blocking finalizer) would let the Application vanish while still orphaning a resource — the same end state as never having cascade enabled, just harder to notice because cascade was supposedly on.
+
+### Two things this is not
+
+- **Not `prune: true`.** That's a §4 sync-time option — on every sync, it deletes whatever the tracking label/annotation says belongs to this Application but is no longer present in Git. It runs on ordinary syncs and has nothing to do with the `Application` object being deleted.
+- **Not the same finalizer kubectl's own `--cascade=foreground` uses.** That flag puts Kubernetes' built-in `foregroundDeletion` finalizer on the *owner* object itself, so *it* can't leave etcd until GC finishes the dependents — still a GC-driven, ownerReferences-based mechanism under the hood. ArgoCD's cascade delete also accepts a `--propagation-policy=foreground|background` flag with the same two names, but it's Argo's own finalizer and Argo's own controller loop doing the equivalent job by hand, not GC.
+
+### What's Not Covered Here
+
+What happens when a tracked resource itself has a blocking finalizer that never clears (does the Application sit `Terminating` forever, and is that surfaced anywhere short of `kubectl describe`); `PreDelete`/`PostDelete` resource hooks and how they interleave with the deletion walk above; cascade behavior for an app-of-apps — does deleting the parent `Application` cascade through to child `Applications`' own managed resources, or just to the child `Application` objects themselves; and what the controller does with a destination cluster that's unreachable mid-cascade (does it retry indefinitely, or does the finalizer removal eventually get forced).
+
 The worst verdict in the tree came from a built-in check three levels down, not from any of the Lua-derived ones sitting at the top — and the aggregation doesn't distinguish where a verdict came from. A `Degraded` Pod overrides three `Healthy` Lua results just as readily as a `Degraded` custom resource would override three healthy Pods.
