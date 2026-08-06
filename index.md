@@ -109,6 +109,7 @@ Kept in sync whenever a doc is created or a section is added — see
 
 - [`kubelet.md`](./kubelet.md) — Kubelet & Node-Level Mechanics
   - `kubectl exec` Internals: Namespace-Joining, Proxying, and the Kubelet's Own API
+  - From Binding to Running: How the Kubelet Actually Creates a Pod
 
 - [`kubernetes_operators.md`](./kubernetes_operators.md) — Kubernetes Operators
   - Chapter 1: From `kubectl apply` to Running Pods
