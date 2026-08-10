@@ -228,6 +228,7 @@ Kept in sync whenever a doc is created or a section is added — see
   - What This Covers So Far
 
 - [`services_and_load_balancing.md`](./services_and_load_balancing.md) — Services & Load Balancing: Spread vs. Balance
+  - Walking a Packet: Pod → Service → Pod, and Back
   - Can a ClusterIP Service Ensure Load Balancing for TCP Traffic?
   - The Proper Way: An L7-Aware Entity
   - How L7 Entities Actually Achieve Balance

@@ -4,6 +4,45 @@ Covers how a `ClusterIP` Service actually gets a packet to a Pod, what that mech
 
 ---
 
+## Walking a Packet: Pod → Service → Pod, and Back
+
+A Pod `curl`s a Service's DNS name. Six distinct mechanisms hand the packet off to each other before a byte reaches the target Pod — none of them is "the Service" doing anything, because the Service object itself is just a record sitting in etcd. It never runs, watches, or touches a packet.
+
+### 1. DNS Resolution
+
+CoreDNS resolves `myservice.myns.svc.cluster.local` to the Service's `ClusterIP` (e.g. `10.96.5.20`). At this point nothing below has happened yet — the `ClusterIP` isn't bound to any real interface anywhere in the cluster. It exists purely as a rule, not an address anyone's network stack actually owns.
+
+### 2. Leaving the Pod
+
+The client Pod sends a packet with `dst=10.96.5.20:port`. It leaves the Pod's network namespace over its veth pair and arrives at the other end of that pair, which sits in the **root network namespace of the Pod's own node**. From the host kernel's point of view, a packet arriving on an interface — not generated locally by a process in the root netns — enters the netfilter pipeline at `PREROUTING`, before any routing decision is made.
+
+### 3. DNAT: ClusterIP → Pod IP
+
+`kube-proxy` runs as a DaemonSet, one instance per node. Every instance independently watches Services and EndpointSlices and, ahead of time, programs an identical rule set into its own node's netfilter tables — nothing is computed at packet-arrival time. The chain structure: `KUBE-SERVICES` matches `dst=ClusterIP:port` and jumps to a per-Service chain (`KUBE-SVC-<hash>`), which holds one weighted rule per Pod in the Service's EndpointSlice (`KUBE-SEP-<hash>`), selected by random-probability matching. (The same `KUBE-SERVICES` jump is also hooked into `OUTPUT`, covering the other case — traffic generated directly by a process in the node's own root netns, e.g. a `hostNetwork` Pod or the kubelet.)
+
+This selection is only made **once per connection**: the first packet (the SYN, for TCP) is what gets evaluated against the chain, picking one backend Pod IP. The DNAT rewrite (`dst: ClusterIP:port → PodIP:targetPort`) and the chosen backend are then recorded as a conntrack entry, keyed by the connection's 5-tuple. Every subsequent packet in that same connection matches the conntrack entry directly and skips rule evaluation entirely — one connection, one backend, for its entire life.
+
+### 4. Getting to the Right Node
+
+The rewritten destination is a Pod IP, which very likely lives on a different node than the one that just performed the DNAT. This part isn't kube-proxy's job, and it isn't done per-Pod — it's the CNI plugin's job, set up per-**node**. Each node is allocated a slice of the cluster's overall Pod CIDR when it joins (e.g. node A gets `10.244.1.0/24`, node B gets `10.244.2.0/24`), so every other node only needs one route per node — "the whole `10.244.1.0/24` block is reachable via node A" — instead of one route per Pod. How that route actually moves the packet depends on the plugin: some encapsulate (VXLAN, wrapping the packet in another one addressed to the destination node), others do native L3 routing (BGP-advertised routes, or cloud-provider VPC routes for CNIs that hand Pods real VPC IPs).
+
+### 5. The Last Hop: Host → Pod
+
+Arriving at the correct node only solves "which machine." That node may be running dozens of Pods, each in its own network namespace, each behind its own veth pair — the kernel still needs to know which local interface delivers this specific Pod IP. That's a per-**Pod** host route, created the moment the CNI plugin sets up the Pod's veth pair (e.g. `10.244.1.5 via veth1234`). Node-level routing (step 4) is per-node and set up once; this last-centimeter delivery is per-Pod and set up at Pod creation.
+
+### 6. The Reply: Undoing the DNAT, for Free
+
+The reply packet leaves the target Pod with `src=PodIP`, but the client is waiting for a response from the `ClusterIP` it originally sent to, not from some Pod IP it's never seen. No second rule handles this — conntrack does it automatically. Because the original DNAT was recorded as part of the connection's tracked state, conntrack recognizes the reply as belonging to that same connection and applies the *inverse* transformation before the packet continues: `src: PodIP → ClusterIP`. One DNAT rule, applied on the way in; conntrack reverses it for free on the way out.
+
+### What This Section Doesn't Cover
+
+- **Readiness gating.** The EndpointSlice controller doesn't just match Pods by label — it also gates on readiness. A Pod matching the selector with a failing readiness probe doesn't show up as an endpoint at all, even though it matches the selector.
+- **IPVS and eBPF dataplanes.** Everything above is kube-proxy's default iptables mode. IPVS mode (hash tables, real scheduling algorithms) and eBPF-based dataplanes (e.g. Cilium replacing kube-proxy entirely) do the same job through different mechanisms.
+- **External traffic.** NodePort and LoadBalancer Services take a different path onto the cluster, with `externalTrafficPolicy` changing source-IP-preservation behavior — not covered here.
+- **Headless Services.** A Service with `clusterIP: None` skips this entire mechanism — DNS returns Pod IPs directly, with no ClusterIP and no kube-proxy involvement at all.
+
+---
+
 ## Can a ClusterIP Service Ensure Load Balancing for TCP Traffic?
 
 > **Question:** Can a Service of type `ClusterIP` ensure load balancing for TCP traffic?
@@ -11,6 +50,8 @@ Covers how a `ClusterIP` Service actually gets a packet to a Pod, what that mech
 **Short answer: it can only ever produce statistical *spread* across connections, never true load-aware *balancing* — and that ceiling isn't a missing feature, it's a structural consequence of operating at L4.**
 
 ### How a ClusterIP Actually Gets a Request to a Pod
+
+(Full hop-by-hop trace: see "Walking a Packet: Pod → Service → Pod, and Back" above.)
 
 There is no load-balancer *process* in this picture — no pod, no proxy sitting in the traffic path. `kube-proxy` runs on every node, watches Endpoints/EndpointSlice for the Service, and programs identical netfilter (iptables) or IPVS rules into every node's own kernel. `ClusterIP` isn't bound to a real interface anywhere — it exists only as a DNAT rule, intercepted wherever a packet happens to be processed, almost always the node the *client* pod is running on. The decision is made independently, locally, per node, with no shared state and no global view of current load.
 
