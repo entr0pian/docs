@@ -43,6 +43,64 @@ The reply packet leaves the target Pod with `src=PodIP`, but the client is waiti
 
 ---
 
+## NodePort: Walking a Packet, External Client → Pod
+
+`NodePort` reuses every mechanism from the `ClusterIP` walk above — same `KUBE-SVC-<hash>`/`KUBE-SEP-<hash>` chains, same one-decision-per-connection DNAT, same conntrack. What's new is only the entry point, and one wrinkle that never shows up in the pure-internal case: **conntrack state lives on a single node**, and the backend DNAT happens to pick might not.
+
+### The Reservation
+
+Creating a `NodePort` Service allocates exactly **one** port number from a fixed range (default `30000–32767`) — not a range per node, one specific port. `kube-proxy` then programs a `KUBE-NODEPORTS` rule for that port on **every node in the cluster**, including nodes running zero Pods that match the Service's selector. Any node's IP on that port is a valid entry point, regardless of where the workload actually lives.
+
+### Same-Node Case: No New Mechanism
+
+An external client sends a packet to `NodeA_IP:NodePort`. It hits `PREROUTING` on Node A, matches the `KUBE-NODEPORTS` chain instead of `KUBE-SERVICES`, but jumps into the exact same per-Service chain as before. If the Pod DNAT selects happens to live on Node A itself, nothing else changes — reply comes back, Node A's conntrack reverses the DNAT for free, done.
+
+### Cross-Node Case: Why Per-Node Conntrack Matters
+
+Say the DNAT on Node A selects a Pod that lives on Node B. The packet's `dst` gets rewritten to that Pod's IP and the CNI routes it to Node B — but its `src` is still untouched: the real external client's IP.
+
+If nothing else happened, the Pod on Node B would reply directly to that real client IP via ordinary routing, entirely bypassing Node A. The client would receive a reply from a `PodIP` it never sent anything to, instead of from `NodeA_IP` where it believes the connection lives — indistinguishable from a spoofed packet, and dropped.
+
+Node A is the only place the conntrack entry for this connection exists, so the reply *must* be forced back through it. `kube-proxy` does this with an extra step beyond DNAT: it also marks the packet for **masquerade** (`KUBE-MARK-MASQ`, applied via a `MASQUERADE` rule in `KUBE-POSTROUTING`), rewriting `src: ClientIP → NodeA_IP` before handing the packet to the CNI. Both halves — the DNAT to the Pod and the SNAT to Node A's own IP — are recorded together in Node A's conntrack entry.
+
+Now the Pod on Node B believes *Node A* is the client, and replies there via plain routing (no CNI trickery needed for the return — Node A is just another routable node). Node A's conntrack recognizes the reply and reverses both transformations in one shot before the final packet goes out to the real client.
+
+### `externalTrafficPolicy: Cluster` (default)
+
+Any node may forward to any Pod cluster-wide, masquerading whenever the pick lands on a different node. Consequence: **the Pod never sees the real client IP** — it sees `NodeA_IP` instead, because that's who it thinks sent the request. The upside is even connection spread regardless of how Pods happen to be placed across nodes.
+
+### `externalTrafficPolicy: Local`
+
+`kube-proxy` refuses to select a cross-node backend at all — a node only forwards to Pods running locally on itself. No masquerade ever happens, so the real client IP survives end to end.
+
+This requires the external load balancer to stop sending traffic to nodes with zero local ready Pods, which is what the auto-allocated `healthCheckNodePort` is for — a lightweight endpoint the cloud LB polls per node to learn its local ready-endpoint count, removing empty nodes from rotation.
+
+The real cost: cloud load balancers distribute evenly across **healthy nodes**, not per-Pod. Two Pods on Node A and one Pod on Node B still get roughly equal traffic *per node*, meaning Node B's single Pod absorbs what Node A splits two ways. `Local` trades correctness (real client IP) for a new manual obligation: keeping Pods evenly spread across nodes yourself (anti-affinity / topology spread constraints), or eating silent hot-spotting.
+
+| | `Cluster` (default) | `Local` |
+|---|---|---|
+| Cross-node forwarding | Allowed | Never — local Pods only |
+| Masquerade / SNAT | Applied when crossing nodes | Never needed |
+| Client IP seen by Pod | `NodeA_IP` (lost) | Real client IP (preserved) |
+| Traffic distribution | Even across all Pods cluster-wide | Even across healthy *nodes*, not Pods — needs even Pod spread |
+| Extra machinery | None | `healthCheckNodePort` |
+
+### Where This Matters in Practice
+
+`Local` is close to mandatory for anything internet-facing where source IP is meaningful — most notably the `LoadBalancer` Service fronting an nginx-ingress-controller Deployment, since nginx needs the real client IP for logging, IP-based rate limiting, and populating `X-Forwarded-For` correctly for the app behind it. `Cluster` would hand nginx `NodeA_IP` as "the client" for every request.
+
+This entire mechanism is also worth bounding: it's irrelevant to the AWS Load Balancer Controller's IP-mode target groups, covered elsewhere in this repo — no kube-proxy, no NodePort, no conntrack involved there, since the ALB talks directly to Pod IPs. `externalTrafficPolicy` only governs NodePort-backed paths: ALB *instance* mode, bare-metal `MetalLB`, and nginx-ingress's own fronting Service.
+
+### What This Section Doesn't Cover
+
+- **`LoadBalancer` Service type and the cloud-controller-manager.** Which component actually watches for `type: LoadBalancer` and calls the cloud provider's API to provision the real external LB, and how it wires that LB's targets back to the NodePort mechanism above.
+- **IPVS-mode differences.** Whether the masquerade requirement changes under IPVS instead of iptables.
+- **`healthCheckNodePort` protocol details.** The exact request/response shape the cloud LB polls.
+- **Session affinity interaction.** How `sessionAffinity: ClientIP` behaves once `externalTrafficPolicy: Local` is already pinning by node.
+- **Dual-stack / IPv6 NodePort behavior.**
+
+---
+
 ## Can a ClusterIP Service Ensure Load Balancing for TCP Traffic?
 
 > **Question:** Can a Service of type `ClusterIP` ensure load balancing for TCP traffic?
