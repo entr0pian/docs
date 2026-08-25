@@ -98,18 +98,6 @@ Kept in sync whenever a doc is created or a section is added — see
   - sync.Once
   - Fan-Out / Fan-In Pipeline Pattern
 
-- [`ingress.md`](./ingress.md) — Ingress: Routing Rules and the Controllers That Implement Them
-  - The Ingress Spec: Field Reference
-    - `pathType` Semantics
-  - Implementation 1: AWS Load Balancer Controller
-    - Step by Step: What Gets Provisioned
-    - Walking a Request (IP Mode)
-  - Implementation 2: ingress-nginx
-    - The Service It Still Needs
-    - Two Different Sync Mechanisms, Not One
-  - Side by Side
-  - What This Doc Doesn't Cover
-
 - [`keda_sqs_autoscaling.md`](./keda_sqs_autoscaling.md) — KEDA SQS Autoscaling
   - What is KEDA?
   - Architecture
@@ -250,6 +238,17 @@ Kept in sync whenever a doc is created or a section is added — see
   - Can a ClusterIP Service Ensure Load Balancing for TCP Traffic?
   - The Proper Way: An L7-Aware Entity
   - How L7 Entities Actually Achieve Balance
+  - Ingress: Two Ways to Implement an L7-Aware Entity
+    - The Ingress Spec: Field Reference
+      - `pathType` Semantics
+    - Implementation 1: AWS Load Balancer Controller
+      - Step by Step: What Gets Provisioned
+      - Walking a Request (IP Mode)
+    - Implementation 2: ingress-nginx
+      - The Service It Still Needs
+      - Two Different Sync Mechanisms, Not One
+    - Side by Side
+    - What This Section Doesn't Cover
   - Takeaway
 
 - [`sqs_worker_context_cancellation.md`](./sqs_worker_context_cancellation.md) — SQS Worker — Context, Cancellation and Shutdown
