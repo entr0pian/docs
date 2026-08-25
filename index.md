@@ -231,6 +231,10 @@ Kept in sync whenever a doc is created or a section is added — see
   - Walking a Packet: Pod → Service → Pod, and Back
   - NodePort: Walking a Packet, External Client → Pod
     - `externalTrafficPolicy: Cluster` (default) vs `Local`
+  - LoadBalancer: A Cloud LB Provisioned on Top of NodePort
+    - Who Provisions It: the cloud-controller-manager
+    - Why the Default LB Is L4, Not L7
+    - When Spread Is Actually Fine
   - Can a ClusterIP Service Ensure Load Balancing for TCP Traffic?
   - The Proper Way: An L7-Aware Entity
   - How L7 Entities Actually Achieve Balance

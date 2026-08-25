@@ -101,6 +101,88 @@ This entire mechanism is also worth bounding: it's irrelevant to the AWS Load Ba
 
 ---
 
+## LoadBalancer: A Cloud LB Provisioned on Top of NodePort
+
+`type: LoadBalancer` doesn't replace the mechanisms above — it's built directly on top of both of them. Creating one still allocates a `ClusterIP` *and* a `NodePort` under the hood (visible as the `NodePort` column in `kubectl get svc`, unless explicitly disabled with `allocateLoadBalancerNodePorts: false`). The only genuinely new piece is a component that provisions a real external load balancer and wires its targets to that `NodePort`.
+
+### Who Provisions It: the cloud-controller-manager
+
+The **cloud-controller-manager's Service controller** watches for Service objects with `spec.type: LoadBalancer`, same watch-reconcile pattern as every other controller in this repo. On seeing one, it calls the cloud provider's API to create the real resource — an AWS NLB, a GCP external passthrough LB, etc. — configures its targets as `NodeIP:NodePort` across the cluster's nodes, then writes the result back onto the Service object's `status.loadBalancer.ingress` field once provisioning completes (that's what populates the `EXTERNAL-IP` column in `kubectl get svc`).
+
+Once provisioned, traffic follows exactly the path already traced in the `NodePort` section above — the cloud LB is just what's now sending packets at `NodeIP:NodePort`, and `externalTrafficPolicy` still governs whether that forwarding can cross nodes (and lose client IP) or stays node-local.
+
+### Why the Default LB Is L4, Not L7
+
+This is a direct consequence of how `Service` is defined as an API object: `spec.ports` only carries a port number and a protocol (`TCP`/`UDP`) — no HTTP semantics, no concept of a host header or a path. The Service controller has nothing HTTP-aware to hand to the cloud API even if it wanted to; an L7 LB's API (listener rules matching host/path) needs information a `Service` object was never designed to carry. **This is the structural reason `Ingress` exists as its own resource type** rather than `Service` simply growing more fields — `Service` stays deliberately protocol-agnostic, and `Ingress` is the purpose-built surface for carrying L7 semantics down to an L7-capable LB.
+
+The practical result, tying back to this doc's opening question: a bare `type: LoadBalancer` Service gives you the exact same **spread, not balance** ceiling as `ClusterIP`/`NodePort` — it's still just an L4 mechanism, one layer further out.
+
+### When Spread Is Actually Fine
+
+- **Non-HTTP protocols.** `Ingress` is HTTP/HTTPS-only by definition — a DNS server, an MQTT broker, a UDP game server, raw database access, or an SSH bastion has no L7 option to begin with.
+- **TLS passthrough / mTLS.** An L4 LB forwards encrypted bytes untouched; the app terminates TLS itself. An L7 proxy terminating and re-encrypting would need the private key, breaking true end-to-end client-cert auth.
+- **One connection *is* the whole unit of work.** A persistent streaming session where per-request rebalancing wouldn't do anything useful anyway.
+- **Minimizing moving parts for a single exposed service**, trading away L7 features for not having to run an ingress controller at all.
+
+### Example: a plain TCP service, spread is enough
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-external
+  namespace: cache
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local   # preserve real client IP, avoid the cross-node masquerade hop
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+      protocol: TCP
+```
+
+Redis's wire protocol isn't HTTP, so there's nothing for an L7 proxy to route on — a bare L4 LB is the only option, not a compromise.
+
+### Example: the one LoadBalancer Service in an nginx-ingress cluster
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local   # nginx needs the real client IP
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/component: controller
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 443
+```
+
+This is the pattern the earlier Ingress discussion converges on: exactly **one** `LoadBalancer` Service exists in the whole cluster, paid for once, fronting the shared nginx-ingress-controller Deployment. Every application behind it is exposed via an `Ingress` object instead — never getting an LB of its own — so an L4 hop is paid once, and L7 balance (real per-request routing across backend Pods) is what nginx itself provides for every app behind that single entry point.
+
+### What This Section Doesn't Cover
+
+- **IP-mode `LoadBalancer` Services.** Newer versions of the AWS Load Balancer Controller can also manage plain `type: LoadBalancer` Services directly in IP mode (bypassing `NodePort` entirely, mirroring the Ingress IP-mode case covered elsewhere in this repo) — not the default/in-tree path described above.
+- **`status.loadBalancer.ingress` propagation and DNS.** How long provisioning actually takes, and how a hostname/IP there becomes something clients can resolve.
+- **Cross-zone load balancing settings** and their cost implications on cloud NLBs.
+- **UDP-specific LB behavior** — health checking and connection tracking differ from TCP.
+
+---
+
 ## Can a ClusterIP Service Ensure Load Balancing for TCP Traffic?
 
 > **Question:** Can a Service of type `ClusterIP` ensure load balancing for TCP traffic?
