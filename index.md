@@ -229,9 +229,26 @@ Kept in sync whenever a doc is created or a section is added — see
 
 - [`services_and_load_balancing.md`](./services_and_load_balancing.md) — Services & Load Balancing: Spread vs. Balance
   - Walking a Packet: Pod → Service → Pod, and Back
+  - NodePort: Walking a Packet, External Client → Pod
+    - `externalTrafficPolicy: Cluster` (default) vs `Local`
+  - LoadBalancer: A Cloud LB Provisioned on Top of NodePort
+    - Who Provisions It: the cloud-controller-manager
+    - Why the Default LB Is L4, Not L7
+    - When Spread Is Actually Fine
   - Can a ClusterIP Service Ensure Load Balancing for TCP Traffic?
   - The Proper Way: An L7-Aware Entity
   - How L7 Entities Actually Achieve Balance
+  - Ingress: Two Ways to Implement an L7-Aware Entity
+    - The Ingress Spec: Field Reference
+      - `pathType` Semantics
+    - Implementation 1: AWS Load Balancer Controller
+      - Step by Step: What Gets Provisioned
+      - Walking a Request (IP Mode)
+    - Implementation 2: ingress-nginx
+      - The Service It Still Needs
+      - Two Different Sync Mechanisms, Not One
+    - Side by Side
+    - What This Section Doesn't Cover
   - Takeaway
 
 - [`sqs_worker_context_cancellation.md`](./sqs_worker_context_cancellation.md) — SQS Worker — Context, Cancellation and Shutdown
