@@ -98,6 +98,18 @@ Kept in sync whenever a doc is created or a section is added — see
   - sync.Once
   - Fan-Out / Fan-In Pipeline Pattern
 
+- [`ingress.md`](./ingress.md) — Ingress: Routing Rules and the Controllers That Implement Them
+  - The Ingress Spec: Field Reference
+    - `pathType` Semantics
+  - Implementation 1: AWS Load Balancer Controller
+    - Step by Step: What Gets Provisioned
+    - Walking a Request (IP Mode)
+  - Implementation 2: ingress-nginx
+    - The Service It Still Needs
+    - Two Different Sync Mechanisms, Not One
+  - Side by Side
+  - What This Doc Doesn't Cover
+
 - [`keda_sqs_autoscaling.md`](./keda_sqs_autoscaling.md) — KEDA SQS Autoscaling
   - What is KEDA?
   - Architecture
