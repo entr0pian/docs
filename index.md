@@ -227,6 +227,16 @@ Kept in sync whenever a doc is created or a section is added — see
   - Key Interactions
   - What This Covers So Far
 
+- [`service_mesh.md`](./service_mesh.md) — Service Mesh: Istio
+  - Architecture: Control Plane and Data Plane
+  - Load Balancing: The Least-Request Algorithm
+  - Walking a Request End to End: Pod → Sidecar → Sidecar → Pod
+  - Canary Deployments: VirtualService and DestinationRule
+    - The Resources
+    - Field Reference
+    - How the 90/10 Split Actually Gets Enforced
+  - What This Covers So Far
+
 - [`services_and_load_balancing.md`](./services_and_load_balancing.md) — Services & Load Balancing: Spread vs. Balance
   - Walking a Packet: Pod → Service → Pod, and Back
   - NodePort: Walking a Packet, External Client → Pod
