@@ -133,6 +133,10 @@ Kept in sync whenever a doc is created or a section is added — see
   - Scenario: Replace an Unresponsive Worker Node
   - Scenario: Ensure Data Persistence for a Stateful Application
   - Scenario: Pod Stuck in Pending State
+  - Scenario: Requests, Limits, QoS and the HPA
+  - Scenario: `kubectl drain` Blocked by a PodDisruptionBudget
+  - Scenario: QoS and Pod Priority Under Memory Pressure
+  - Scenario: Upgrading a Production EKS Cluster
 
 - [`limit_ranges.md`](./limit_ranges.md) — Kubernetes LimitRange
   - Overview
