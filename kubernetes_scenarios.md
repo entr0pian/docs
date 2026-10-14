@@ -1209,6 +1209,100 @@ The extra cost is worth paying for prod. It buys the one thing an EKS upgrade ot
 
 ---
 
+### Part 2 — Order and Skew
+
+#### The skew rule: clients may lag, never lead
+
+Since 1.28 the kubelet may be up to **three minor versions older** than kube-apiserver, and **never newer**. So a 1.33 control plane can run 1.32 (or 1.30) nodes, but a 1.33 kubelet must never talk to a 1.32 API server.
+
+The asymmetry follows from which side guarantees compatibility. The API server is the server, and it promises to keep serving older clients: it still understands the requests, fields and API versions that 1.30–1.32 kubelets send. It can make that promise only for versions that already exist. A newer kubelet may use a field or behaviour that the old API server has never heard of, and that fails in one of two ways:
+
+- **An error.** The request names something the API server doesn't serve, and it's rejected.
+- **Silent data loss.** The request carries a field the API server doesn't know, so the API server **drops the unknown field** when it stores the object. The kubelet believes it reported something; the stored object doesn't have it. Nothing alerts on this, which makes it worse than the error.
+
+The one-way skew is what makes an in-place upgrade possible at all: the control plane moves first, and the nodes keep running their workloads on the old kubelet until they're replaced. The API server's promise to older clients isn't open-ended, though. It holds only as long as the API versions those clients use are still served, which is exactly where Part 3 goes wrong.
+
+#### Controllers must span both versions
+
+Your own controllers (Karpenter, cert-manager, the policy engine, ArgoCD) are API clients too, but they don't follow the control plane the way add-ons do. Each one has to work on **both** versions during the transition: on 1.32 before the flip and on 1.33 after it.
+
+- If the current version already supports 1.33, nothing to do.
+- If it doesn't, but a newer version supports both 1.32 and 1.33, upgrade the controller **before** the control plane. Then the flip changes nothing from its point of view.
+- If no single version covers both, it's a two-step change (controller, control plane, controller again), and the plan has to say so explicitly.
+
+A version that *requires* 1.33 can't go first; it wouldn't run on the 1.32 cluster.
+
+When a controller is incompatible, what breaks is **that controller's reconcile loop**, not the cluster: Karpenter stops provisioning, ArgoCD stops diffing, cert-manager stops renewing. Workloads that are already running keep running. Karpenter is the one that matters most here, because it's what replaces every node in step 4. If it breaks after the flip, the upgrade stalls halfway with no way to provision nodes.
+
+#### Add-ons follow the control plane
+
+The EKS add-ons work the other way round. VPC CNI, CoreDNS and kube-proxy have versions published per Kubernetes release, and CoreDNS and kube-proxy are bumped **after** the control plane, to the versions published for 1.33. kube-proxy in particular must never be newer than kube-apiserver, the same rule as the kubelet. Upgrading it before the control plane breaks skew.
+
+#### The order
+
+| Step | What | Why here |
+|---|---|---|
+| 1 | Own controllers (Karpenter, cert-manager, policy engine, ArgoCD) to versions supporting both 1.32 and 1.33 | They must survive the flip; Karpenter is the node-roll engine |
+| 2 | Control plane 1.32 → 1.33 | The irreversible step; everything after depends on it |
+| 3 | EKS add-ons (VPC CNI, CoreDNS, kube-proxy) to their 1.33 versions | They follow the control-plane version |
+| 4 | Nodes, via Karpenter drift to the 1.33 AMI | Kubelet last; skew allows it to lag until you get there |
+
+Because EKS upgrades the control plane one minor at a time, going further (say 1.33 to 1.35) repeats steps 1–3 per minor. Nodes can stay behind for up to three minors, but they shouldn't: every skipped roll is a bigger jump later.
+
+---
+
+### Part 3 — The Surprise After the Flip
+
+The control plane is on 1.33. One ArgoCD app goes red:
+
+```
+ComparisonError: no matches for kind "HorizontalPodAutoscaler" in version "autoscaling/v2beta2"
+```
+
+The HPA is still there, still scaling its Deployment, and `kubectl get hpa payments -o yaml` returns it without complaint.
+
+#### An object isn't stored "as" the version you sent
+
+A resource can be **served** in several versions (`autoscaling/v2beta2`, `autoscaling/v2`), but it's **stored** in etcd in exactly one: the storage version. Every read and write is converted between the version the client asked for and the storage version. The version in your manifest decides how you *talk* about the object, not how it's kept.
+
+A version is never removed while it's still the storage version:
+
+- **Built-in types:** the storage version moves to the new version at least one release before the old one stops being served. Each object is re-encoded in the new version the next time it's written.
+- **CRDs:** the same thing is explicit. Each entry in `spec.versions` has `served` and `storage` flags, and `status.storedVersions` records every version that may still be in etcd. The API server refuses to drop a version from the CRD while it's listed there. To remove it, you first run a storage migration (re-write every object), then prune the list.
+
+So removing `v2beta2` only stops the API server **accepting requests that name it**. The objects in etcd are untouched, and anything asking for `v2` gets them as before.
+
+#### Why the workload is fine
+
+Nothing that *runs* the HPA uses `v2beta2`. The HPA controller lives in kube-controller-manager, which ships with the control plane, so after the flip it talks to the API server in whatever 1.33 serves. Scaling continues.
+
+#### Why ArgoCD breaks: it never gets as far as a request
+
+To fetch a live object, a client has to turn the manifest's **group/version/kind** into a URL path (group/version/**resource**). It does that with the **RESTMapper**, a lookup table built from the API server's **discovery** data (the list of groups, versions and resources it currently serves):
+
+1. ArgoCD renders the app from Git and finds `apiVersion: autoscaling/v2beta2`, `kind: HorizontalPodAutoscaler`.
+2. It asks the RESTMapper for the matching resource, to build `/apis/autoscaling/v2beta2/namespaces/payments/horizontalpodautoscalers/payments`.
+3. Discovery on 1.33 no longer lists `autoscaling/v2beta2`. The lookup fails **inside ArgoCD**: `no matches for kind ... in version ...`.
+
+No HTTP request is ever sent, so ArgoCD can't fetch the live object to diff against. That's why it's a `ComparisonError` and not a sync failure. Only the **desired state in Git** is broken, not the cluster.
+
+The fix is in Git: change the manifest to `autoscaling/v2`. Check the schema too, since a version bump can rename or restructure fields.
+
+#### Why the pre-check missed it
+
+`kubectl get hpa` goes through discovery too, but it doesn't pick a version from a manifest: it asks for the **preferred** version the API server advertises. On 1.32 that already is `v2`, so the output looks the same whichever version created the object, and it would look the same on 1.33. A `kubectl get` on live objects tells you nothing about which versions **clients send**. The problem isn't in the objects; it's in the callers.
+
+#### What would have caught it
+
+Look at the callers, not the objects:
+
+- **Static, from Git:** render every app the way ArgoCD will on the target version, then check the result against what 1.33 serves (`pluto`/`kubent` do this; a server dry-run on a 1.33 cluster does it too). Rendering has to be told the target: charts often choose an `apiVersion` with `.Capabilities.APIVersions.Has "autoscaling/v2"`, and plain `helm template` uses default capabilities. ArgoCD passes the real cluster's API versions to Helm, so a chart written that way switches to `v2` on its own after the flip. Only a hard-coded old version breaks.
+- **At runtime, from the API server:** Git doesn't hold every caller. Operators create objects in code, CI and cron scripts call the API directly, and Helm keeps old releases with their old `apiVersion`s. The API server sees all of them. It marks deprecated-API requests in the **audit log** and counts them in the `apiserver_requested_deprecated_apis` metric. This is what **EKS Upgrade Insights** reads (Part 1, check 4).
+- **The environment order** from *The Plan*: if dev is managed by ArgoCD from the same Git and is upgraded first, this exact `ComparisonError` shows up there first, where it costs nothing.
+
+---
+
 ### What This Scenario Doesn't Cover Yet
 
-- **Parts 2–4 are still open**: upgrade order and skew policy, why `kubectl get` doesn't reveal removed-API callers, and the webhook outage during the node roll.
+- **Part 4 is still open**: the webhook outage during the node roll.
+- **How kube-proxy is upgraded.** It's a DaemonSet, so bumping the add-on puts the new version on every node, including 1.32 nodes not yet rolled. That's within the upstream kube-proxy ↔ kubelet skew allowance (±3 minors since 1.28; it had to match the kubelet's minor before). Not discussed yet.
