@@ -137,6 +137,7 @@ Kept in sync whenever a doc is created or a section is added — see
   - Scenario: `kubectl drain` Blocked by a PodDisruptionBudget
   - Scenario: QoS and Pod Priority Under Memory Pressure
   - Scenario: Upgrading a Production EKS Cluster
+  - Scenario: Healthy Pods, Intermittent 504s
 
 - [`limit_ranges.md`](./limit_ranges.md) — Kubernetes LimitRange
   - Overview
