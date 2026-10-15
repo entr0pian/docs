@@ -1302,7 +1302,97 @@ Look at the callers, not the objects:
 
 ---
 
+### Part 4 — The Webhook Outage During the Node Roll
+
+Twenty minutes into the Karpenter roll, every new pod creation fails, in every namespace. The ReplicaSets show:
+
+```
+Error creating: Internal error occurred: failed calling webhook "validate.policy.example.io":
+failed to call webhook: Post "https://policy-webhook.policy-system.svc:443/validate?timeout=10s":
+context deadline exceeded
+```
+
+Running pods are fine. But each drained node takes capacity with it, and nothing replaces it.
+
+#### Where the webhook sits in a request
+
+Every write to the API server goes through the same chain before it reaches etcd:
+
+1. Authentication, then authorization (RBAC).
+2. **Mutating admission**, including mutating webhooks.
+3. Schema validation of the (possibly mutated) object.
+4. **Validating admission**, including validating webhooks.
+5. Persist to etcd.
+
+For each `ValidatingWebhookConfiguration` whose `rules` match the request (here: `CREATE` on `pods`, all namespaces), the API server POSTs an `AdmissionReview` to the webhook's Service and waits up to `timeoutSeconds` (default 10s). If the call fails (connection refused, no endpoints, timeout), **`failurePolicy` decides the outcome**: with `Ignore` the request carries on as if the webhook had said yes, and with `Fail` it is rejected. Policy engines ship with `Fail`, because a policy that's skipped whenever its backend is down isn't a policy.
+
+The webhook's backend is an ordinary Deployment behind an ordinary Service. When the roll evicted its last pod, the Service had no endpoints, every call failed, and `Fail` turned that into a rejection of every pod create in the cluster.
+
+#### Why it doesn't heal itself: the deadlock
+
+When the webhook pods were evicted, the ReplicaSet controller immediately tried to create replacements. Those creates are pod `CREATE`s too, so they go through the same webhook, which has no backend, so they're rejected. **The webhook's own replacements need the webhook's approval to exist.** Nothing in the cluster will ever break that loop; a human has to.
+
+The rejection happens at admission, before anything is written to etcd. So no Pod object exists: nothing is `Pending`, the scheduler never sees a pod, and `kubectl get pods` shows only what's still running. The evidence is the `FailedCreate` events on the ReplicaSets and the API server's webhook error metrics. Someone who looks for Pending pods in this incident finds nothing.
+
+#### Why the node roll triggered it
+
+The webhook had worked for months, and nothing about it changed in the upgrade. What changed is that **every node was being replaced**, and the webhook Deployment couldn't survive that:
+
+- **Too few replicas, or all on the same node.** One replica, or two that landed on the same node, go away with one drain.
+- **No PDB, or a PDB that couldn't hold.** Karpenter drift evicts through the Eviction API and respects PDBs. With no PDB, nothing stops it from taking the last pod.
+- **The lower environments didn't catch it**, because they either didn't run the policy engine or had too few nodes to roll for it to matter (*The Plan*: an environment missing the policy engine can't catch Part 4).
+
+#### Now: break the loop
+
+The aim is to let pods be created again, and to keep the policy disabled for as short a time as possible.
+
+1. **Confirm it.** The webhook Service has no endpoints (`kubectl get endpointslices -n policy-system`), and the Deployment has fewer ready replicas than desired, with `FailedCreate` events.
+2. **Stop GitOps from undoing the fix.** The `ValidatingWebhookConfiguration` is delivered by ArgoCD. With `selfHeal` on, ArgoCD reverts a manual patch within minutes and the outage comes back. Disable auto-sync on that app first.
+3. **Exempt the webhook's own namespace, or failing that, set `failurePolicy: Ignore`.** Adding a `namespaceSelector` that excludes `policy-system` breaks the deadlock and keeps the policy enforced everywhere else. Under time pressure, flipping to `Ignore` is the blunter alternative that always works. Deleting the configuration also works, but then you have to restore it from Git exactly.
+4. **Watch the webhook pods come back**, then restore `Fail` (or re-enable sync, so ArgoCD restores it).
+
+`Ignore` costs you something: while it's in place **the policy is not enforced**, so any pod created in that window was admitted without the check. Afterwards, list what was created in the window and re-check it against the policy (most policy engines have a background/audit scan for this).
+
+#### Afterwards: make it impossible, then make it unlikely
+
+**Make the deadlock impossible.** Exclude the webhook's own namespace in the configuration, so it can always bring its own pods back:
+
+```yaml
+webhooks:
+  - name: validate.policy.example.io
+    failurePolicy: Fail
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [policy-system, kube-system]
+```
+
+`kube-system` belongs in that list for the same reason. CoreDNS, the VPC CNI and kube-proxy are what every other pod needs in order to work, and the webhook's own pods need them too. A cluster-critical component must never depend on itself, or on the policy engine, to come back. Most policy engines exclude these namespaces by default; check that the default is still there.
+
+**Make losing every replica unlikely.**
+
+- **At least 3 replicas, with a PDB of `maxUnavailable: 1`.** A PDB of `minAvailable: 2` on 2 replicas leaves `disruptionsAllowed` at 0. Karpenter drift then can't evict either pod, and the roll stalls on those two nodes (see *`kubectl drain` Blocked by a PodDisruptionBudget*). The PDB has to allow progress, not just protect.
+- **Spread across nodes and zones.** `whenUnsatisfiable: ScheduleAnyway` is the right default for most services. For a component that can block every pod create in the cluster, use `DoNotSchedule` on the hostname key (or required pod anti-affinity), so two replicas never share a node. Keep zone spreading soft, so one AZ outage can't leave the pods unschedulable.
+- **A high priority class** (`system-cluster-critical`). The *QoS and Pod Priority* scenario says workloads shouldn't use it. A cluster-wide admission webhook is the kind of component it exists for: it should preempt other pods rather than wait for capacity.
+- **A short `timeoutSeconds`** (2–5s instead of 10). Even when the webhook works, every pod create waits on it. When it's down, a long timeout makes every client wait 10s before failing.
+- **Alert on the webhook, not just the pods.** The API server exports webhook latency and rejection metrics per webhook (`apiserver_admission_webhook_*`). An alert on rejections caused by call failures fires within a minute; one on a policy-system Deployment with fewer than 3 ready replicas fires before the outage.
+
+---
+
+### Senior-Level Insight
+
+Parts 3 and 4 look like the same lesson twice: something you didn't upgrade breaks during the upgrade. The ArgoCD error came from callers still using a removed API. The webhook outage came from a dependency the change exercised for the first time: every node replaced, in one go. An upgrade is the one routine event that touches **everything at once**, so it finds what quietly couldn't survive a full roll. The useful question in planning isn't only "what changes in 1.33" but "what runs in this cluster that has never lived through every node being replaced". Admission webhooks with `Fail` are first on that list, because they turn an outage of a single small component into an outage of the whole cluster's ability to create pods.
+
+---
+
+### Summary
+
+An EKS control-plane upgrade is one-way, so the risk is found and contained before the flip: removed APIs, controller and add-on compatibility, skew, node-roll readiness, and an environment order (or blue/green clusters) that acts as the missing rollback. The order is controllers first, then control plane, add-ons, and nodes last. After the flip, a removed API version breaks callers (ArgoCD's RESTMapper) and not stored objects, which is why a `kubectl get` pre-check misses it and audit logs or rendered manifests catch it. During the roll, a `Fail` validating webhook whose pods were all evicted rejects every pod create, including its own replacements. Break the loop by exempting its namespace or setting `Ignore` (with ArgoCD's self-heal paused), then make it impossible with a `namespaceSelector` and unlikely with replicas, a PDB that allows progress, hard spreading across nodes, and alerting on webhook failures.
+
+---
+
 ### What This Scenario Doesn't Cover Yet
 
-- **Part 4 is still open**: the webhook outage during the node roll.
+- **Network reachability of webhooks.** The API server calls webhooks from the EKS control-plane ENIs. New nodes with a different security group (a changed `EC2NodeClass` selector) can make a webhook running on them unreachable even with healthy pods.
 - **How kube-proxy is upgraded.** It's a DaemonSet, so bumping the add-on puts the new version on every node, including 1.32 nodes not yet rolled. That's within the upstream kube-proxy ↔ kubelet skew allowance (±3 minors since 1.28; it had to match the kubelet's minor before). Not discussed yet.
