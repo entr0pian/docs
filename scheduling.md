@@ -207,19 +207,40 @@ The `kubelet` monitors Node resource consumption and evicts Pods when thresholds
 
 **Eviction thresholds** are configured in the kubelet (e.g., `--eviction-hard=memory.available<100Mi`).
 
-**Eviction order** — the kubelet ranks Pods for eviction as follows:
+**Eviction order** — QoS class is not itself an input to the ranking. Under
+memory pressure, the kubelet sorts the Pods on the Node by three keys, in
+this order:
 
-1. Pods exceeding their resource requests (`BestEffort` QoS first)
-2. `Burstable` Pods that exceed their requests
-3. `Guaranteed` Pods (evicted last, only under extreme pressure)
+1. **Is the Pod's usage of the starved resource above its requests?** Pods
+   over their requests sort ahead of Pods within them.
+2. **Pod priority** (`spec.priority`, resolved from the `PriorityClass`).
+   Lower priority sorts first.
+3. **How far usage is above requests.** The Pod furthest over its requests
+   sorts first.
+
+The kubelet evicts from the front of that list, one Pod at a time, until
+the eviction signal is back above its threshold.
 
 ### QoS Classes and Eviction
 
-| QoS Class | Condition | Eviction Priority |
+The familiar "BestEffort → Burstable → Guaranteed" order isn't a separate
+rule. It falls out of key 1 above:
+
+| QoS Class | Condition | Where key 1 puts it |
 |---|---|---|
-| `BestEffort` | No requests or limits set | Evicted first |
-| `Burstable` | Requests set but < limits, or only some containers have them | Evicted second |
-| `Guaranteed` | Requests == limits for all containers | Evicted last |
+| `BestEffort` | No requests or limits set | Requests are 0, so any usage is "over requests". Always in the first group. |
+| `Burstable` | Requests set but < limits, or only some containers have them | Over or within requests depending on live usage. Can land in either group. |
+| `Guaranteed` | Requests == limits for all containers | The cgroup caps usage at the limit, which equals the request, so it can never be over requests. Always in the last group. |
+
+Two consequences the QoS-only version hides:
+
+- **A Burstable Pod within its requests outranks a BestEffort Pod** for
+  survival, and it sorts alongside Guaranteed Pods. QoS class alone doesn't
+  decide its place; its current usage does.
+- **Priority only reorders Pods inside the same group from key 1.** A
+  high-priority Pod that's over its requests still sorts ahead of a
+  low-priority Pod that's within them. Setting requests close to real usage
+  protects a Pod more reliably than raising its priority.
 
 ---
 
@@ -263,7 +284,7 @@ shutdown handling).
 ## Key Interactions
 
 - **Preemption vs. Eviction** — preemption is scheduler-driven to place a pending Pod; eviction is kubelet-driven to protect a running Node.
-- **PriorityClass affects both** — higher-priority Pods are harder to preempt and harder to evict under node pressure.
+- **PriorityClass affects both** — higher-priority Pods are harder to preempt, and under node pressure they sort later for eviction, but only among Pods on the same side of their requests (see *Eviction order*).
 - **PodDisruptionBudgets** gate the Eviction API path specifically (drains, autoscaler scale-down) — not a controller's own direct Pod deletes (e.g. a Deployment rollout scaling down its old ReplicaSet) — and provide only a soft guarantee during node-pressure eviction.
 - **Resource requests matter** — they are the primary input to both the scheduling decision and the kubelet's eviction ordering.
 - **Pod GC vs. the other removal paths** — eviction and preemption remove a Pod from a Node that still exists, expecting a replacement (if any) to land elsewhere; Pod GC cleans up after the Node itself is gone. `nodeName`'s immutability is exactly why that cleanup has to be a deletion, not a reassignment.
@@ -273,7 +294,8 @@ shutdown handling).
 This covers the scheduling cycle (filtering, scoring, binding) and the
 mechanisms that influence it, the three `NodeResourcesFit` scoring
 strategies, preemption and its PDB interaction, the two standard eviction
-paths plus the `NoExecute`-taint path, PodDisruptionBudget's actual
+paths (including the kubelet's three-key node-pressure ranking and how QoS
+order falls out of it) plus the `NoExecute`-taint path, PodDisruptionBudget's actual
 enforcement point (the Eviction API subresource, not a controller's direct
 Pod deletes) and its live-health-based `disruptionsAllowed` recompute — including
 the concrete case of a Deployment rollout and a node drain contending over
